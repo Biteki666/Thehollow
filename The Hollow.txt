@@ -1,0 +1,4027 @@
+-- ====== LOADER: pilih script berdasarkan ID game ======
+-- Tambah ID lain ke tabel kalau game-nya punya beberapa place (lobby / in-game / dll)
+local HOLLOW_IDS = {116463962153167}   -- -> script Hollow (ESP Radar + Fly + Noclip + Third Person)
+local ESPSPD_IDS = {14451515684, 14476003462, 4991821731}   -- -> script ESP & Speed (14476003462 = Place ID, 4991821731 = Universe ID)
+
+-- ====== LOGO (ganti ID ini kalau mau gambar lain) ======
+local LOGO_ID = 10110319532
+local function logoImage()
+	local ok, res = pcall(function()
+		local obj = game:GetObjects("rbxassetid://" .. LOGO_ID)[1]
+		if obj and (obj:IsA("Decal") or obj:IsA("Texture")) then return obj.Texture end
+		if obj and obj:IsA("ImageLabel") then return obj.Image end
+	end)
+	if ok and res and res ~= "" then return res end
+	return "rbxassetid://" .. LOGO_ID
+end
+
+-- Paksa pilih script tanpa lihat ID (opsional). Taruh SEBELUM menjalankan loader:
+--   _G.FORCE_SCRIPT = "hollow"    atau    _G.FORCE_SCRIPT = "espspeed"
+
+-- ====== PASANG UI DI LUAR MENU ROBLOX (tetap tampil saat ESC dibuka) ======
+-- Urutan: gethui() -> CoreGui -> PlayerGui (cadangan kalau executor tidak mendukung)
+local function mountGui(g)
+	g.ResetOnSpawn = false
+	g.DisplayOrder = 999
+	g.IgnoreGuiInset = true                                       -- boleh sampai ke area topbar Roblox
+	pcall(function() g.ScreenInsets = Enum.ScreenInsets.None end) -- tanpa batas safe-area
+	pcall(function() g.ZIndexBehavior = Enum.ZIndexBehavior.Sibling end)
+	local ok = false
+	if typeof(gethui) == "function" then
+		ok = pcall(function() g.Parent = gethui() end) and g.Parent ~= nil
+	end
+	if not ok then
+		ok = pcall(function() g.Parent = game:GetService("CoreGui") end) and g.Parent ~= nil
+	end
+	if not ok then
+		g.Parent = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
+	end
+	return g
+end
+
+local function runHollow()
+	local Players = game:GetService("Players")
+	local UIS = game:GetService("UserInputService")
+	local TweenService = game:GetService("TweenService")
+	local player = Players.LocalPlayer
+
+	-- kalau script dijalankan ulang, tutup versi lama dulu
+	if _G.ESP_SHUTDOWN then pcall(_G.ESP_SHUTDOWN) end
+
+	-- ====== SETTING ======
+	local RADIUS  = math.huge   -- jarak maksimum tampil (studs), bisa diganti lewat tab Settings
+	local MAX_ESP = 30          -- batas Highlight Roblox itu 31
+	local DEBUG   = true        -- true = cetak info ke Output (bisa diganti lewat tab Settings)
+	local AUTO_PROMPT = true    -- true = otomatis tekan prompt (Get Torch / Light / dll) setelah teleport
+
+	-- ISI TIAP FLOOR: mon = monster, ff = pintu, off = Offering, pump = Pumpkin
+	local FLOORS = {
+		[1] = {mon = true, ff = true},
+		[2] = {mon = true, ff = true},
+		[3] = {mon = true, ff = true},
+		[4] = {mon = true, ff = true},
+		[5] = {mon = true, ff = true},
+		[6] = {mon = true, ff = true},
+		[7] = {mon = true, ff = true, pump = true, brz = true},
+		[8] = {mon = true, ff = true, off = true, shop = true},
+	}
+	local DEFAULT_FLOOR = 1
+
+	-- PUMPKIN (floor 7) - hanya yang nongol yang di-ESP
+	local PUMPKIN_NAME    = "Pumpkin"
+	local PUMPKIN_LABEL   = "PUMPKIN"
+	local PUMPKIN_COLOR   = Color3.fromRGB(255, 145, 0)
+	local PUMPKIN_OUTLINE = Color3.fromRGB(255, 230, 50)
+
+	-- BRAZIER (floor 7) - tempat ambil torch ("Get Torch"), model bernama Brazier di folder Jackolantern
+	local BRAZIER_NAME  = "Brazier"
+	local BRAZIER_LABEL = "BRAZIER"
+	local BRAZIER_COLOR = Color3.fromRGB(255, 200, 60)
+
+	-- TOKO (floor 8) - teleport ke depan Poles > Cylinder.009
+	local SHOP_PART   = "Cylinder.009"
+	local SHOP_FOLDER = "Poles"
+	local SHOP_LABEL  = "TOKO"
+	local SHOP_COLOR  = Color3.fromRGB(120, 200, 255)
+	local SHOP_ESP    = false   -- true = Toko ikut tampil di ESP
+	local SHOP_OFFSET = nil     -- kalau posisi "depan" kurang pas, isi mis. Vector3.new(0, 0, -8) (relatif ke Cylinder.009)
+
+	-- OFFERING (floor 8)
+	local OFFERING_COLOR  = Color3.fromRGB(255, 170, 0)
+	local OFFERING_PREFIX = "^Offering"
+	local OFFERING_NAMES = {
+		-- ["OfferingBell"]   = "Lonceng",
+		-- ["OfferingSkull"]  = "Tengkorak",
+	}
+
+	-- MONSTER
+	local MONSTER_COLOR = Color3.fromRGB(255, 40, 40)
+	local MOBS_FOLDER   = "Mobs"
+	local MONSTER_NAMES = {
+		["Quartz"] = "Monster",
+	}
+
+	-- Forcefield
+	local FF_NAME          = "forcefield"
+	local DEFAULT_FF_COLOR = Color3.fromRGB(0, 255, 120)
+
+	-- URUTAN pintu: "X", "Y", atau "Z"
+	local ORDER_BY = "X"
+
+	local LABELS = {
+		{"Pintu Event Lift", Color3.fromRGB(0, 170, 255)},   -- urutan 1
+		{"Pintu Event Game", Color3.fromRGB(255, 70, 70)},   -- urutan 2
+		{"Pintu Lift",       Color3.fromRGB(0, 255, 120)},   -- urutan 3
+	}
+	-- =====================
+
+	local espOn = false
+	local runId = 0
+	local currentFloor = DEFAULT_FLOOR
+	local candidates = {}
+	local items = {}
+	local addedConn
+	local conns = {}   -- semua koneksi global, dilepas saat script ditutup
+
+	local function track(c) table.insert(conns, c) return c end
+
+	-- ====== BAHASA / LANGUAGE (semua di satu tabel L supaya hemat variabel lokal) ======
+	local L = {
+		lang = (_G.ESP_LANG == "en") and "en" or "id",
+		building = false, builtOnce = false, tpRefreshing = false, tpToken = 0,
+		binds = {}, userScale = tonumber(_G.ESP_SCALE),
+	}
+	L.STR = {
+		id = {
+			hello = "Halo, ", standby = "Standby", scanning = "Scanning…",
+			radar_sub = "Hasil scan di sekitar kamu", nearby = "di sekitar", none = "tidak ada",
+			k_mon = "Monster", k_ff = "Pintu", k_off = "Offering", k_pump = "Pumpkin", k_brz = "Brazier", k_shop = "Toko",
+			esp_tap = "Tekan untuk mengaktifkan", esp_on = "Aktif — memindai objek di sekitarmu",
+			floor_sub = "Pilih lantai yang sedang kamu mainkan",
+			floors_title = "Daftar Floor", floors_sub = "Apa saja yang dilacak di tiap floor. Tap untuk memilih.", active = "AKTIF",
+			tp_sub = "Tujuan khusus Floor %d  •  diurutkan dari yang terdekat",
+			sec_shop = "TOKO", sec_brz = "BRAZIER", sec_pump = "PUMPKIN", sec_off = "OFFERING", sec_ff = "PINTU",
+			empty = "Belum ada target di floor ini. Dekati areanya lalu tekan Refresh.",
+			scanning_list = "Memindai target…", dist_away = "%d studs dari kamu",
+			auto_idle = "Ambil torch di Brazier, lalu nyalakan semua Pumpkin", auto_stopped = "Berhenti",
+			auto_start = "Memulai…", auto_wait = "Menunggu Pumpkin yang bisa dinyalakan…",
+			auto_torch = "Mengambil torch di Brazier…", auto_light = "Menyalakan Pumpkin %d/%d…",
+			auto_nobrz = "Brazier tidak ditemukan, dekati area dulu lalu Refresh",
+			set_radius = "Jarak Maksimum ESP", set_radius_sub = "Batasi ESP hanya untuk objek dalam jarak tertentu (studs)",
+			unlimited = "Tak terbatas",
+			set_auto = "Auto Tekan Prompt", set_auto_sub = "Otomatis Get Torch / Light / klaim item setelah teleport",
+			set_debug = "Debug Output", set_debug_sub = "Cetak info deteksi ke Output (F9)",
+			set_stop = "Hentikan Script", set_stop_sub = "Matikan ESP dan hapus seluruh UI", close = "Tutup",
+			hotkey = "Hotkey: E = toggle ESP  •  Q = buka/tutup menu  •  F = Fly  •  N = Noclip  •  T = Third Person  •  geser title bar untuk memindahkan jendela",
+			toast_lost = "Target hilang, tekan Refresh", toast_tp = "Teleport ke %s", toast_prompt = "Prompt ditekan  •  %s",
+			toast_auto_on = "Auto Torch & Light aktif", toast_auto_off = "Auto Torch & Light mati",
+			toast_esp_on = "ESP aktif  •  Floor %d", toast_esp_off = "ESP mati", toast_lang = "Bahasa: Indonesia",
+			mv_title = "Gerak", mv_sub = "Terbang dan tembus dinding",
+			fly_sub = "Terbang bebas  •  Hotkey F  •  Space naik, Shift turun (di HP: arahkan kamera + tombol ⬆️⬇️)",
+			fly_speed = "Kecepatan Fly", fly_speed_sub = "Atur seberapa cepat kamu terbang (studs per detik)",
+			nc_sub = "Tembus dinding dan objek  •  Hotkey N  •  pakai bersama Fly agar tidak jatuh",
+			toast_fly_on = "Fly aktif", toast_fly_off = "Fly mati", toast_nc_on = "Noclip aktif", toast_nc_off = "Noclip mati",
+			tps_sub = "Kamera dari belakang karakter  •  Hotkey T  •  mouse bebas saat menu ditutup (menu terbuka: tahan klik kanan)  •  scroll / pinch atur jarak",
+			tps_dist = "Jarak Kamera", tps_dist_sub = "Seberapa jauh kamera dari karakter (studs)",
+			toast_tps_on = "Third Person aktif", toast_tps_off = "Third Person mati",
+			set_size = "Ukuran UI", size_auto = "Otomatis",
+			set_size_sub = "Pilih ukuran, atau tarik pojok kanan bawah jendela untuk mengubah ukuran",
+		},
+		en = {
+			hello = "Hello, ", standby = "Standby", scanning = "Scanning…",
+			radar_sub = "Scan results around you", nearby = "nearby", none = "none",
+			k_mon = "Monster", k_ff = "Doors", k_off = "Offering", k_pump = "Pumpkin", k_brz = "Brazier", k_shop = "Shop",
+			esp_tap = "Tap to turn on", esp_on = "Active — scanning nearby objects",
+			floor_sub = "Pick the floor you're playing on",
+			floors_title = "Floor List", floors_sub = "What's tracked on each floor. Tap to select.", active = "ACTIVE",
+			tp_sub = "Floor %d destinations  •  nearest first",
+			sec_shop = "SHOP", sec_brz = "BRAZIER", sec_pump = "PUMPKIN", sec_off = "OFFERING", sec_ff = "DOORS",
+			empty = "No targets on this floor yet. Move closer to the area, then tap Refresh.",
+			scanning_list = "Scanning for targets…", dist_away = "%d studs away",
+			auto_idle = "Grab a torch at the Brazier, then light every Pumpkin", auto_stopped = "Stopped",
+			auto_start = "Starting…", auto_wait = "Waiting for a Pumpkin that can be lit…",
+			auto_torch = "Getting a torch at the Brazier…", auto_light = "Lighting Pumpkin %d/%d…",
+			auto_nobrz = "Brazier not found. Move closer, then tap Refresh",
+			set_radius = "ESP Max Distance", set_radius_sub = "Only show ESP for objects within a set distance (studs)",
+			unlimited = "Unlimited",
+			set_auto = "Auto Press Prompt", set_auto_sub = "Automatically Get Torch / Light / claim items after teleporting",
+			set_debug = "Debug Output", set_debug_sub = "Print detection info to Output (F9)",
+			set_stop = "Stop Script", set_stop_sub = "Turn off ESP and remove the whole UI", close = "Close",
+			hotkey = "Hotkey: E = toggle ESP  •  Q = show/hide menu  •  F = Fly  •  N = Noclip  •  T = Third Person  •  drag the title bar to move the window",
+			toast_lost = "Target is gone, tap Refresh", toast_tp = "Teleported to %s", toast_prompt = "Prompt pressed  •  %s",
+			toast_auto_on = "Auto Torch & Light on", toast_auto_off = "Auto Torch & Light off",
+			toast_esp_on = "ESP on  •  Floor %d", toast_esp_off = "ESP off", toast_lang = "Language: English",
+			mv_title = "Movement", mv_sub = "Fly and walk through walls",
+			fly_sub = "Free flight  •  Hotkey F  •  Space up, Shift down (mobile: aim camera + ⬆️⬇️ buttons)",
+			fly_speed = "Fly Speed", fly_speed_sub = "How fast you fly (studs per second)",
+			nc_sub = "Walk through walls and objects  •  Hotkey N  •  use with Fly so you don't fall",
+			toast_fly_on = "Fly on", toast_fly_off = "Fly off", toast_nc_on = "Noclip on", toast_nc_off = "Noclip off",
+			tps_sub = "Camera behind your character  •  Hotkey T  •  free mouse look when menu is closed (menu open: hold right-click)  •  scroll / pinch for distance",
+			tps_dist = "Camera Distance", tps_dist_sub = "How far the camera sits from your character (studs)",
+			toast_tps_on = "Third Person on", toast_tps_off = "Third Person off",
+			set_size = "UI Size", size_auto = "Auto",
+			set_size_sub = "Pick a size, or drag the window's bottom-right corner to resize",
+		},
+	}
+	L.LABEL_EN = {["Pintu Event Lift"] = "Event Lift Door", ["Pintu Event Game"] = "Event Game Door", ["Pintu Lift"] = "Lift Door"}
+	function L.T(k, ...)
+		local s = L.STR[L.lang][k] or L.STR.id[k] or k
+		if select("#", ...) > 0 then return string.format(s, ...) end
+		return s
+	end
+	function L.bind(obj, prop, fn)
+		obj[prop] = fn()
+		table.insert(L.binds, {obj, prop, fn})
+	end
+	function L.refresh()
+		for _, b in ipairs(L.binds) do
+			if b[1].Parent then pcall(function() b[1][b[2]] = b[3]() end) end
+		end
+	end
+	function L.cname(c)
+		if L.lang == "en" and c.nameEN then return c.nameEN end
+		return c.name
+	end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "ESPGui"
+	mountGui(gui)
+
+	-- ====== UI KIT ======
+	local THEME = {
+		bg        = Color3.fromRGB(14, 14, 16),
+		side      = Color3.fromRGB(18, 18, 21),
+		card      = Color3.fromRGB(24, 24, 28),
+		tile      = Color3.fromRGB(33, 33, 38),
+		tileHover = Color3.fromRGB(44, 44, 51),
+		text      = Color3.fromRGB(240, 240, 244),
+		muted     = Color3.fromRGB(142, 142, 152),
+		dim       = Color3.fromRGB(96, 96, 106),
+		light     = Color3.fromRGB(232, 232, 238),
+		lightDark = Color3.fromRGB(150, 150, 160),
+		on        = Color3.fromRGB(70, 220, 140),
+		off       = Color3.fromRGB(110, 110, 122),
+		trackOff  = Color3.fromRGB(48, 48, 56),
+	}
+
+	local function tween(obj, time, props, style, dir)
+		local t = TweenService:Create(obj, TweenInfo.new(time, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out), props)
+		t:Play()
+		return t
+	end
+
+	local function make(class, props, parent)
+		local o = Instance.new(class)
+		for k, v in pairs(props) do o[k] = v end
+		o.Parent = parent
+		return o
+	end
+
+	local function corner(obj, r)
+		return make("UICorner", {CornerRadius = UDim.new(0, r)}, obj)
+	end
+
+	local function subtleStroke(obj, transp)
+		return make("UIStroke", {
+			Color = Color3.new(1, 1, 1), Transparency = transp or 0.93, Thickness = 1,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		}, obj)
+	end
+
+	local function lightGradient(obj, rot)
+		return make("UIGradient", {
+			Color = ColorSequence.new(THEME.light, THEME.lightDark),
+			Rotation = rot or 0,
+		}, obj)
+	end
+
+	local function addPress(button)
+		local sc = make("UIScale", {Scale = 1}, button)
+		local function release() tween(sc, 0.3, {Scale = 1}, Enum.EasingStyle.Back) end
+		button.MouseButton1Down:Connect(function() tween(sc, 0.1, {Scale = 0.95}) end)
+		button.MouseButton1Up:Connect(release)
+		button.MouseLeave:Connect(release)
+	end
+
+	local function addHover(button, normal, hover)
+		button.MouseEnter:Connect(function() tween(button, 0.18, {BackgroundColor3 = hover}) end)
+		button.MouseLeave:Connect(function() tween(button, 0.25, {BackgroundColor3 = normal}) end)
+	end
+
+	local function hex(c)
+		return string.format("#%02X%02X%02X", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
+	end
+
+	local function esc(s)
+		return (tostring(s):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+	end
+
+	local function label(parent, props)
+		local p = {
+			BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham,
+			TextSize = 12,
+			TextColor3 = THEME.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}
+		local key, fn = props.key, props.fn
+		for k, v in pairs(props) do
+			if k ~= "key" and k ~= "fn" then p[k] = v end
+		end
+		local o = make("TextLabel", p, parent)
+		if key then L.bind(o, "Text", function() return L.T(key) end)
+		elseif fn then L.bind(o, "Text", fn) end
+		return o
+	end
+
+	-- kartu dengan tint warna halus di salah satu sisi (gaya screenshot)
+	local function tintCard(parent, pos, size, tint, rot, strength)
+		local card = make("Frame", {Position = pos, Size = size, BackgroundColor3 = THEME.card, BorderSizePixel = 0}, parent)
+		corner(card, 14)
+		subtleStroke(card)
+		local tf = make("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = tint, BorderSizePixel = 0}, card)
+		corner(tf, 14)
+		make("UIGradient", {
+			Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, strength or 0.55),
+				NumberSequenceKeypoint.new(0.6, 0.94),
+				NumberSequenceKeypoint.new(1, 1),
+			}),
+			Rotation = rot or 0,
+		}, tf)
+		return card, tf
+	end
+
+	-- switch geser
+	local function makeSwitch(parent, pos)
+		local trackF = make("Frame", {
+			AnchorPoint = Vector2.new(1, 0.5), Position = pos,
+			Size = UDim2.fromOffset(52, 28), BackgroundColor3 = THEME.trackOff, BorderSizePixel = 0,
+		}, parent)
+		corner(trackF, 14)
+		local onF = make("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = THEME.on, BackgroundTransparency = 1, BorderSizePixel = 0}, trackF)
+		corner(onF, 14)
+		local knob = make("Frame", {
+			Position = UDim2.new(0, 3, 0.5, -11), Size = UDim2.fromOffset(22, 22),
+			BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+		}, trackF)
+		corner(knob, 11)
+		local sw = {}
+		function sw.set(on, instant)
+			local kp = on and UDim2.new(0, 27, 0.5, -11) or UDim2.new(0, 3, 0.5, -11)
+			local tp = on and 0 or 1
+			if instant then
+				knob.Position = kp
+				onF.BackgroundTransparency = tp
+			else
+				tween(knob, 0.4, {Position = kp}, Enum.EasingStyle.Back)
+				tween(onF, 0.3, {BackgroundTransparency = tp})
+			end
+		end
+		return sw
+	end
+
+	local function iconButton(parent, text, pos)
+		local b = make("TextButton", {
+			AnchorPoint = Vector2.new(1, 0.5), Position = pos, Size = UDim2.fromOffset(30, 30),
+			BackgroundColor3 = THEME.tile, AutoButtonColor = false, BorderSizePixel = 0,
+			Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = THEME.muted, Text = text,
+		}, parent)
+		corner(b, 8)
+		subtleStroke(b)
+		addPress(b)
+		addHover(b, THEME.tile, THEME.tileHover)
+		return b
+	end
+
+	-- ====== HELPER ======
+	local function getPos(target)
+		if target:IsA("Model") then
+			return target:GetPivot().Position
+		end
+		return target.Position
+	end
+
+	local function firstPart(target)
+		if target:IsA("BasePart") then return target end
+		return target:FindFirstChildWhichIsA("BasePart", true)
+	end
+
+	local function getParts(obj)
+		local parts = {}
+		if obj:IsA("BasePart") then
+			table.insert(parts, obj)
+		elseif obj:IsA("Model") then
+			for _, item in ipairs(obj:GetDescendants()) do
+				if item:IsA("BasePart") then
+					table.insert(parts, item)
+				end
+			end
+		end
+		return parts
+	end
+
+	local function pumpkinVisible(obj)
+		if not obj:IsDescendantOf(workspace) then
+			return false
+		end
+		for _, part in ipairs(getParts(obj)) do
+			if part.Transparency < 1
+				and part.LocalTransparencyModifier < 1
+				and part.Size.Magnitude > 0 then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function insideOffering(obj)
+		local p = obj.Parent
+		while p and p ~= workspace do
+			if p:IsA("Model") and p.Name:match(OFFERING_PREFIX) then
+				return true
+			end
+			p = p.Parent
+		end
+		return false
+	end
+
+	local function insideCandidate(obj)
+		local p = obj.Parent
+		while p and p ~= workspace do
+			if candidates[p] then return true end
+			p = p.Parent
+		end
+		return false
+	end
+
+	local function offeringDisplayName(name)
+		if OFFERING_NAMES[name] then
+			return OFFERING_NAMES[name]
+		end
+		local short = (name:gsub(OFFERING_PREFIX, ""))
+		if short == "" then return name end
+		return short
+	end
+
+	-- ====== LABEL PINTU ======
+	local function relabel(quiet)
+		local list = {}
+		for _, c in pairs(candidates) do
+			if c.isFF then table.insert(list, c) end
+		end
+
+		table.sort(list, function(a, b)
+			local va, vb = getPos(a.target)[ORDER_BY], getPos(b.target)[ORDER_BY]
+			if va ~= vb then return va < vb end
+			return a.target:GetFullName() < b.target:GetFullName()
+		end)
+
+		for i, c in ipairs(list) do
+			local lab = LABELS[i]
+			if lab then
+				c.name = lab[1]
+				c.nameEN = L.LABEL_EN[lab[1]]
+				c.color = lab[2] or DEFAULT_FF_COLOR
+			else
+				c.name = "Forcefield #" .. i
+				c.nameEN = nil
+				c.color = DEFAULT_FF_COLOR
+			end
+		end
+
+		if DEBUG and not quiet then
+			print("[ESP] Urutan Forcefield (berdasarkan " .. ORDER_BY .. "):")
+			for i, c in ipairs(list) do
+				local p = getPos(c.target)
+				print(string.format("  #%d  %s  | X=%d Y=%d Z=%d | %s (%s)",
+					i, c.name, p.X, p.Y, p.Z, c.target:GetFullName(), c.target.ClassName))
+			end
+		end
+	end
+
+	-- ====== DAFTAR KANDIDAT ======
+	local function addMonster(target)
+		if candidates[target] or insideOffering(target) or insideCandidate(target) then return end
+		candidates[target] = {
+			target = target, adornee = firstPart(target),
+			color = MONSTER_COLOR, name = MONSTER_NAMES[target.Name] or target.Name,
+			isFF = false, kind = "mon",
+		}
+	end
+
+	local function register(obj)
+		-- 1) Model Offering
+		if obj:IsA("Model") and obj.Name:match(OFFERING_PREFIX) and not insideOffering(obj) then
+			if not candidates[obj] then
+				candidates[obj] = {
+					target = obj, adornee = firstPart(obj),
+					color = OFFERING_COLOR, name = offeringDisplayName(obj.Name), isFF = false, kind = "off",
+				}
+			end
+			return false
+		end
+
+		-- 2) Forcefield (Model atau Part)
+		if obj.Name:lower() == FF_NAME
+			and (obj:IsA("Model") or obj:IsA("BasePart"))
+			and not candidates[obj]
+			and not insideOffering(obj)
+			and not insideCandidate(obj) then
+			candidates[obj] = {
+				target = obj, adornee = firstPart(obj),
+				color = DEFAULT_FF_COLOR, name = "Forcefield", isFF = true, kind = "ff",
+			}
+			return true
+		end
+
+		-- 3) Pumpkin (Model atau Part)
+		if obj.Name:lower() == PUMPKIN_NAME:lower()
+			and (obj:IsA("Model") or obj:IsA("BasePart"))
+			and not candidates[obj]
+			and not insideOffering(obj)
+			and not insideCandidate(obj) then
+			candidates[obj] = {
+				target = obj, adornee = firstPart(obj),
+				color = PUMPKIN_COLOR, outline = PUMPKIN_OUTLINE,
+				name = PUMPKIN_LABEL, isFF = false, kind = "pump",
+			}
+			return false
+		end
+
+		-- 3b) Brazier (tempat ambil torch)
+		if obj.Name:lower() == BRAZIER_NAME:lower()
+			and (obj:IsA("Model") or obj:IsA("BasePart"))
+			and not candidates[obj]
+			and not insideOffering(obj)
+			and not insideCandidate(obj) then
+			candidates[obj] = {
+				target = obj, adornee = firstPart(obj),
+				color = BRAZIER_COLOR, name = BRAZIER_LABEL, isFF = false, kind = "brz",
+			}
+			return false
+		end
+
+		-- 3c) Toko: Cylinder.009 di dalam folder Poles
+		if obj.Name == SHOP_PART
+			and (obj:IsA("BasePart") or obj:IsA("Model"))
+			and obj.Parent and obj.Parent.Name:lower() == SHOP_FOLDER:lower()
+			and not candidates[obj] then
+			candidates[obj] = {
+				target = obj, adornee = firstPart(obj),
+				color = SHOP_COLOR, name = SHOP_LABEL, nameEN = "SHOP", isFF = false, kind = "shop",
+			}
+			return false
+		end
+
+		-- 4) Monster: model yang langsung ada di folder "Mobs"
+		if obj:IsA("Model") and obj.Parent and obj.Parent.Name:lower() == MOBS_FOLDER:lower() then
+			addMonster(obj)
+			return false
+		end
+
+		return false
+	end
+
+	local function buildCandidates(quiet)
+		-- kalau sudah ada scan yang jalan, tunggu saja sampai selesai
+		if L.building then
+			while L.building do task.wait() end
+			return
+		end
+		L.building = true
+		candidates = {}
+		local mirip = {}
+		local cnt = 0
+		for _, obj in ipairs(workspace:GetDescendants()) do
+			pcall(register, obj)
+			if #mirip < 15 and obj.Name:lower():find("force") then
+				table.insert(mirip, obj:GetFullName() .. " [" .. obj.ClassName .. "]")
+			end
+			cnt += 1
+			if cnt % 1200 == 0 then task.wait() end   -- bagi kerja ke beberapa frame, biar UI tidak nyangkut
+		end
+		L.building = false
+		L.builtOnce = true
+		relabel(quiet)
+		if DEBUG and not quiet then
+			local n = {mon = 0, ff = 0, off = 0, pump = 0, brz = 0, shop = 0}
+			local pumpNongol = 0
+			for _, c in pairs(candidates) do
+				n[c.kind] += 1
+				if c.kind == "pump" and pumpkinVisible(c.target) then
+					pumpNongol += 1
+				end
+			end
+			print("[ESP] Ditemukan -> monster:", n.mon, "| pintu:", n.ff, "| offering:", n.off,
+				"| pumpkin total:", n.pump, "(nongol:", pumpNongol .. ")")
+			if n.mon == 0 then
+				print("[ESP] Monster 0. Pastikan folder '" .. MOBS_FOLDER .. "' ada di Workspace (bukan ServerStorage/ReplicatedStorage).")
+			end
+			if n.pump == 0 then
+				print("[ESP] Pumpkin 0. Kalau di floor 7, pastikan namanya '" .. PUMPKIN_NAME .. "' dan sudah dimuat (dekati areanya).")
+			end
+			print("[ESP] Objek yang namanya mengandung 'force':")
+			for _, s in ipairs(mirip) do print("   ", s) end
+			if #mirip == 0 then
+				print("   (tidak ada. Mungkin StreamingEnabled / objek belum dimuat, dekati pintunya dulu)")
+			end
+		end
+	end
+
+	-- ====== ESP ITEM (label pill + animasi fade) ======
+	local function labelText(c, dist)
+		return string.format('<font color="%s">●</font>  %s  <font color="#A5A5B0">%d studs</font>',
+			hex(c.color), esc(L.cname(c)), dist)
+	end
+
+	local function addItem(key, c)
+		if DEBUG then
+			print("[ESP kena]", c.name, "->", c.target:GetFullName(), c.target.ClassName)
+		end
+
+		local hl = Instance.new("Highlight")
+		hl.Adornee = c.target
+		hl.FillColor = c.color
+		hl.FillTransparency = 1
+		hl.OutlineTransparency = 1
+		hl.OutlineColor = c.outline or Color3.new(1, 1, 1)
+		hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		hl.Parent = gui
+		tween(hl, 0.35, {FillTransparency = 0.4, OutlineTransparency = 0})
+
+		local box
+		if c.isFF and c.adornee then
+			box = Instance.new("BoxHandleAdornment")
+			box.Adornee = c.adornee
+			if c.target:IsA("Model") then
+				local cf, size = c.target:GetBoundingBox()
+				box.CFrame = c.adornee.CFrame:ToObjectSpace(cf)
+				box.Size = size
+			else
+				box.Size = c.target.Size
+			end
+			box.Color3 = c.color
+			box.Transparency = 0.6
+			box.AlwaysOnTop = true
+			box.ZIndex = 1
+			box.Parent = gui
+		end
+
+		local bb = make("BillboardGui", {
+			Adornee = c.adornee,
+			Size = UDim2.fromOffset(300, 40),
+			AlwaysOnTop = true,
+			StudsOffset = Vector3.new(0, 2, 0),
+		}, gui)
+
+		local pill = make("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(0, 28),
+			AutomaticSize = Enum.AutomaticSize.X,
+			BackgroundColor3 = Color3.fromRGB(14, 14, 16),
+			BackgroundTransparency = 1,
+			BorderSizePixel = 0,
+		}, bb)
+		corner(pill, 14)
+		make("UIPadding", {PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12)}, pill)
+		local stroke = make("UIStroke", {
+			Color = c.color, Thickness = 1.5, Transparency = 1,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		}, pill)
+
+		local lbl = make("TextLabel", {
+			Size = UDim2.new(0, 0, 1, 0),
+			AutomaticSize = Enum.AutomaticSize.X,
+			BackgroundTransparency = 1,
+			RichText = true,
+			Font = Enum.Font.GothamBold,
+			TextSize = 13,
+			TextColor3 = THEME.text,
+			TextTransparency = 1,
+			Text = labelText(c, 0),
+		}, pill)
+
+		tween(bb, 0.4, {StudsOffset = Vector3.new(0, 3, 0)}, Enum.EasingStyle.Back)
+		tween(pill, 0.3, {BackgroundTransparency = 0.18})
+		tween(stroke, 0.3, {Transparency = 0.1})
+		tween(lbl, 0.3, {TextTransparency = 0})
+
+		items[key] = {hl = hl, bb = bb, pill = pill, stroke = stroke, label = lbl, box = box, text = ""}
+	end
+
+	local function removeItem(key, instant)
+		local it = items[key]
+		if not it then return end
+		items[key] = nil
+		if it.box then it.box:Destroy() end
+		if instant then
+			it.hl:Destroy()
+			it.bb:Destroy()
+			return
+		end
+		tween(it.hl, 0.2, {FillTransparency = 1, OutlineTransparency = 1})
+		tween(it.pill, 0.2, {BackgroundTransparency = 1})
+		tween(it.stroke, 0.2, {Transparency = 1})
+		tween(it.label, 0.2, {TextTransparency = 1})
+		task.delay(0.25, function()
+			it.hl:Destroy()
+			it.bb:Destroy()
+		end)
+	end
+
+	local function clearAll()
+		for key in pairs(items) do
+			removeItem(key, true)
+		end
+	end
+
+	-- ====================================================
+	-- ================== WINDOW UI =======================
+	-- ====================================================
+	local W, H, SIDE, TOP = 600, 380, 56, 46
+
+	local cam = workspace.CurrentCamera
+	local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+	-- skala = otomatis (ikut layar) atau pilihan user, selalu dibatasi supaya muat di layar
+	function L.calcScale(v)
+		local limit = math.min((v.X - 24) / W, (v.Y - 24) / H)
+		local auto = math.clamp(limit, 0.4, 1.25)
+		local maxAllowed = math.max(0.4, math.min(limit, 1.6))
+		return math.clamp(L.userScale or auto, 0.4, maxAllowed)
+	end
+	local baseScale = L.calcScale(Vector2.new(vp.X, vp.Y - 36))
+	local winW, winH = math.floor(W * baseScale), math.floor(H * baseScale)
+
+	local win = make("Frame", {
+		Name = "ESPWindow",
+		Size = UDim2.fromOffset(winW, winH),
+		Position = UDim2.fromOffset(math.max(0, math.floor((vp.X - winW) / 2)), math.max(12, math.floor((vp.Y - winH) / 2 - 20))),
+		BackgroundTransparency = 1,
+	}, gui)
+
+	local scaler = make("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(W, H),
+		BackgroundTransparency = 1,
+	}, win)
+	local scaleObj = make("UIScale", {Scale = baseScale * 0.85}, scaler)
+
+	local border = make("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1}, scaler)
+	corner(border, 18)
+	local borderStroke = make("UIStroke", {
+		Color = Color3.new(1, 1, 1), Thickness = 1.5, Transparency = 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	}, border)
+	local borderGrad = make("UIGradient", {
+		Color = ColorSequence.new({
+			ColorSequenceKeypoint.new(0, Color3.fromRGB(215, 215, 222)),
+			ColorSequenceKeypoint.new(0.5, Color3.fromRGB(60, 60, 68)),
+			ColorSequenceKeypoint.new(1, Color3.fromRGB(215, 215, 222)),
+		}),
+	}, borderStroke)
+	L.borderTween = TweenService:Create(borderGrad, TweenInfo.new(7, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, -1), {Rotation = 360})
+	L.borderTween:Play()
+
+	local card = make("CanvasGroup", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = THEME.bg,
+		BorderSizePixel = 0,
+		GroupTransparency = 1,
+		Active = true,
+	}, scaler)
+	corner(card, 18)
+
+	tween(card, 0.5, {GroupTransparency = 0})
+	tween(borderStroke, 0.7, {Transparency = 0.35})
+	tween(scaleObj, 0.6, {Scale = baseScale}, Enum.EasingStyle.Back)
+
+	-- ---------- TITLE BAR ----------
+	local titleBar = make("Frame", {
+		Size = UDim2.new(1, 0, 0, TOP),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Active = true,
+	}, card)
+
+	-- LOGO (gambar)
+	local logo = make("Frame", {
+		Position = UDim2.fromOffset(14, 9), Size = UDim2.fromOffset(28, 28),
+		BackgroundTransparency = 1, BorderSizePixel = 0,
+	}, titleBar)
+	corner(logo, 8)
+	make("ImageLabel", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+		Image = logoImage(), ScaleType = Enum.ScaleType.Fit,
+	}, logo)
+
+	label(titleBar, {
+		Position = UDim2.fromOffset(52, 0), Size = UDim2.new(1, -290, 1, 0),
+		Font = Enum.Font.GothamBold, TextSize = 16, RichText = true,
+		Text = 'The Hollow  <font color="#8E8E98" size="12"></font>',
+	})
+
+	local closeBtn = iconButton(titleBar, "×", UDim2.new(1, -14, 0.5, 0))
+	closeBtn.TextSize = 20
+	local minBtn = iconButton(titleBar, "–", UDim2.new(1, -52, 0.5, 0))
+
+	-- pill status
+	local statusPill = make("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -96, 0.5, 0),
+		Size = UDim2.fromOffset(98, 26),
+		BackgroundColor3 = THEME.card, BorderSizePixel = 0,
+	}, titleBar)
+	corner(statusPill, 13)
+	subtleStroke(statusPill)
+	make("UIPadding", {PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 12)}, statusPill)
+	make("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 7),
+		HorizontalAlignment = Enum.HorizontalAlignment.Center,
+		VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder,
+	}, statusPill)
+	local statusDot = make("Frame", {
+		LayoutOrder = 1, Size = UDim2.fromOffset(8, 8), BackgroundColor3 = THEME.off, BorderSizePixel = 0,
+	}, statusPill)
+	corner(statusDot, 4)
+	local statusText = label(statusPill, {
+		LayoutOrder = 2, Size = UDim2.fromOffset(0, 26), AutomaticSize = Enum.AutomaticSize.X,
+		Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = THEME.muted, Text = "Standby",
+	})
+	local dotPulse = TweenService:Create(statusDot, TweenInfo.new(0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {BackgroundTransparency = 0.65})
+
+	-- ---------- SWITCH BAHASA (bendera) ----------
+	do
+		local pill = make("Frame", {
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -202, 0.5, 0),
+			Size = UDim2.fromOffset(66, 26), BackgroundColor3 = THEME.card, BorderSizePixel = 0,
+		}, titleBar)
+		corner(pill, 13)
+		subtleStroke(pill)
+		L.ind = make("Frame", {
+			Position = UDim2.fromOffset(3, 3), Size = UDim2.fromOffset(30, 20),
+			BackgroundColor3 = THEME.tileHover, BorderSizePixel = 0,
+		}, pill)
+		corner(L.ind, 10)
+		subtleStroke(L.ind, 0.8)
+		L.btns = {}
+		for i, code in ipairs({"id", "en"}) do
+			local b = make("TextButton", {
+				Position = UDim2.fromOffset(3 + (i - 1) * 30, 3), Size = UDim2.fromOffset(30, 20),
+				BackgroundTransparency = 1, AutoButtonColor = false,
+				Font = Enum.Font.Gotham, TextSize = 14, TextColor3 = THEME.text,
+				TextTransparency = code == L.lang and 0 or 0.55,
+				Text = code == "id" and "🇮🇩" or "🇬🇧", ZIndex = 2,
+			}, pill)
+			addPress(b)
+			L.btns[code] = b
+		end
+		L.ind.Position = UDim2.fromOffset(L.lang == "id" and 3 or 33, 3)
+	end
+
+	make("Frame", {
+		Position = UDim2.new(0, 0, 0, TOP - 1), Size = UDim2.new(1, 0, 0, 1),
+		BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.93, BorderSizePixel = 0,
+	}, card)
+
+	-- ---------- SIDEBAR ----------
+	local sidebar = make("Frame", {
+		Position = UDim2.fromOffset(0, TOP), Size = UDim2.fromOffset(SIDE, H - TOP),
+		BackgroundTransparency = 1, BorderSizePixel = 0,
+	}, card)
+	-- latar sidebar: hanya sudut kiri-bawah yang melengkung (ikut lengkungan jendela)
+	local sbBg = make("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = THEME.side, BorderSizePixel = 0}, sidebar)
+	corner(sbBg, 18)
+	make("Frame", {Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = THEME.side, BorderSizePixel = 0}, sidebar)
+	make("Frame", {
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(1, 0), Size = UDim2.new(0, 30, 1, 0),
+		BackgroundColor3 = THEME.side, BorderSizePixel = 0,
+	}, sidebar)
+	make("Frame", {
+		Position = UDim2.new(1, -1, 0, 0), Size = UDim2.new(0, 1, 1, 0),
+		BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.94, BorderSizePixel = 0,
+	}, sidebar)
+
+	local TABS = {{"🏠", "Home"}, {"🌀", "Teleport"}, {"🏢", "Floors"}, {"🚀", "Move"}, {"⚙️", "Settings"}}
+	local function tabY(i) return 12 + (i - 1) * 48 end
+
+	local tabIndicator = make("Frame", {
+		Position = UDim2.fromOffset(8, tabY(1)), Size = UDim2.fromOffset(40, 40),
+		BackgroundColor3 = THEME.tileHover, BorderSizePixel = 0,
+	}, sidebar)
+	corner(tabIndicator, 10)
+	subtleStroke(tabIndicator, 0.85)
+
+	local tabButtons = {}
+	for i, t in ipairs(TABS) do
+		local b = make("TextButton", {
+			Position = UDim2.fromOffset(8, tabY(i)), Size = UDim2.fromOffset(40, 40),
+			BackgroundTransparency = 1, AutoButtonColor = false,
+			Font = Enum.Font.GothamBold, TextSize = 18, TextColor3 = THEME.text,
+			TextTransparency = i == 1 and 0 or 0.5, Text = t[1],
+		}, sidebar)
+		addPress(b)
+		tabButtons[i] = b
+	end
+
+	local avatarHolder = make("Frame", {
+		Position = UDim2.fromOffset(8, H - TOP - 52), Size = UDim2.fromOffset(40, 40),
+		BackgroundColor3 = THEME.tile, BorderSizePixel = 0,
+	}, sidebar)
+	corner(avatarHolder, 20)
+	subtleStroke(avatarHolder, 0.8)
+	local avatarImages = {}
+	local av1 = make("ImageLabel", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Image = ""}, avatarHolder)
+	corner(av1, 20)
+	table.insert(avatarImages, av1)
+
+	-- ---------- AREA KONTEN ----------
+	local content = make("Frame", {
+		Position = UDim2.fromOffset(SIDE, TOP), Size = UDim2.fromOffset(W - SIDE, H - TOP),
+		BackgroundTransparency = 1, ClipsDescendants = true,
+	}, card)
+
+	local PAGE_POS = UDim2.fromOffset(14, 14)
+	local PAGE_SIZE = UDim2.fromOffset(W - SIDE - 28, H - TOP - 28)  -- 516 x 306
+
+	local function newPage(visible)
+		return make("Frame", {
+			Position = visible and PAGE_POS or UDim2.fromOffset(14, 14 + (H - TOP)),
+			Size = PAGE_SIZE, BackgroundTransparency = 1,
+			Visible = visible,
+		}, content)
+	end
+
+	local homePage = newPage(true)
+	local tpPage = newPage(false)
+	local floorsPage = newPage(false)
+	local settingsPage = make("ScrollingFrame", {
+		Position = UDim2.fromOffset(14, 14 + (H - TOP)), Size = PAGE_SIZE, BackgroundTransparency = 1,
+		BorderSizePixel = 0, Visible = false, ScrollBarThickness = 3, ScrollBarImageColor3 = THEME.dim,
+		CanvasSize = UDim2.fromOffset(0, 428), ScrollingDirection = Enum.ScrollingDirection.Y,
+		ElasticBehavior = Enum.ElasticBehavior.Never,
+	}, content)
+	L.movePage = make("ScrollingFrame", {
+		Position = UDim2.fromOffset(14, 14 + (H - TOP)), Size = PAGE_SIZE, BackgroundTransparency = 1,
+		BorderSizePixel = 0, Visible = false, ScrollBarThickness = 3, ScrollBarImageColor3 = THEME.dim,
+		CanvasSize = UDim2.fromOffset(0, 470), ScrollingDirection = Enum.ScrollingDirection.Y,
+		ElasticBehavior = Enum.ElasticBehavior.Never,
+	}, content)
+	local pages = {homePage, tpPage, floorsPage, L.movePage, settingsPage}   -- pages[4] = Move
+
+	-- ===== HOME: greeting =====
+	local greet = tintCard(homePage, UDim2.fromOffset(0, 0), UDim2.fromOffset(516, 72), Color3.new(1, 1, 1), 0, 0.9)
+	local avHolder2 = make("Frame", {
+		Position = UDim2.fromOffset(14, 12), Size = UDim2.fromOffset(48, 48),
+		BackgroundColor3 = THEME.tile, BorderSizePixel = 0,
+	}, greet)
+	corner(avHolder2, 24)
+	local av2 = make("ImageLabel", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Image = ""}, avHolder2)
+	corner(av2, 24)
+	table.insert(avatarImages, av2)
+
+	label(greet, {
+		Position = UDim2.fromOffset(76, 14), Size = UDim2.new(1, -190, 0, 22),
+		Font = Enum.Font.GothamBold, TextSize = 16, RichText = true,
+		fn = function() return L.T("hello") .. esc(player.DisplayName) end,
+	})
+	local greetSub = label(greet, {
+		Position = UDim2.fromOffset(76, 38), Size = UDim2.new(1, -190, 0, 16),
+		TextSize = 11, TextColor3 = THEME.muted, Text = "",
+	})
+	local floorBadge = make("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -16, 0.5, 0),
+		Size = UDim2.fromOffset(84, 30), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+	}, greet)
+	corner(floorBadge, 15)
+	lightGradient(floorBadge, 35)
+	local floorBadgeText = label(floorBadge, {
+		Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center,
+		Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Color3.fromRGB(20, 20, 24), Text = "FLOOR 1",
+	})
+
+	-- ===== HOME: kartu Radar (statistik) =====
+	local radarCard = tintCard(homePage, UDim2.fromOffset(0, 82), UDim2.fromOffset(252, 224), Color3.fromRGB(0, 200, 110), 70, 0.6)
+	label(radarCard, {Position = UDim2.fromOffset(14, 12), Size = UDim2.new(1, -28, 0, 18), Font = Enum.Font.GothamBold, TextSize = 15, Text = "Radar"})
+	label(radarCard, {Position = UDim2.fromOffset(14, 32), Size = UDim2.new(1, -28, 0, 14), TextSize = 10, TextColor3 = THEME.muted, key = "radar_sub"})
+
+	local STATS = {
+		{"mon",  "Monster",  MONSTER_COLOR},
+		{"ff",   "Pintu",    DEFAULT_FF_COLOR},
+		{"off",  "Offering", OFFERING_COLOR},
+		{"pump", "Pumpkin",  PUMPKIN_COLOR},
+	}
+	local statBoxes = {}
+	for i, s in ipairs(STATS) do
+		local col, row = (i - 1) % 2, math.floor((i - 1) / 2)
+		local tile = make("Frame", {
+			Position = UDim2.fromOffset(14 + col * 116, 56 + row * 80), Size = UDim2.fromOffset(108, 72),
+			BackgroundColor3 = THEME.tile, BackgroundTransparency = 0.15, BorderSizePixel = 0,
+		}, radarCard)
+		corner(tile, 10)
+		subtleStroke(tile)
+		label(tile, {
+			Position = UDim2.fromOffset(12, 9), Size = UDim2.new(1, -24, 0, 14), RichText = true,
+			Font = Enum.Font.GothamMedium, TextSize = 10, TextColor3 = THEME.muted,
+			fn = function() return string.format('<font color="%s">●</font>  %s', hex(s[3]), L.T("k_" .. s[1])) end,
+		})
+		local num = label(tile, {
+			Position = UDim2.fromOffset(12, 25), Size = UDim2.new(1, -24, 0, 26),
+			Font = Enum.Font.GothamBlack, TextSize = 22, Text = "0",
+		})
+		local numScale = make("UIScale", {Scale = 1}, num)
+		local sub = label(tile, {
+			Position = UDim2.fromOffset(12, 52), Size = UDim2.new(1, -24, 0, 12),
+			TextSize = 9, TextColor3 = THEME.dim, Text = L.T("nearby"),
+		})
+		statBoxes[s[1]] = {tile = tile, num = num, scale = numScale, sub = sub}
+	end
+
+	-- ===== HOME: kartu ESP (toggle) =====
+	local espCard, espTint = tintCard(homePage, UDim2.fromOffset(264, 82), UDim2.fromOffset(252, 76), Color3.fromRGB(255, 70, 70), 0, 0.55)
+	local espBtn = make("TextButton", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 5}, espCard)
+	addPress(espBtn)
+	label(espCard, {Position = UDim2.fromOffset(16, 14), Size = UDim2.new(1, -100, 0, 20), Font = Enum.Font.GothamBold, TextSize = 17, Text = "ESP"})
+	local espSub = label(espCard, {
+		Position = UDim2.fromOffset(16, 38), Size = UDim2.new(1, -100, 0, 28),
+		TextSize = 11, TextColor3 = THEME.muted, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
+		Text = L.T("esp_tap"),
+	})
+	local espSwitch = makeSwitch(espCard, UDim2.new(1, -16, 0.5, 0))
+
+	-- ===== HOME: kartu pilih floor =====
+	local floorCard = tintCard(homePage, UDim2.fromOffset(264, 168), UDim2.fromOffset(252, 138), Color3.fromRGB(255, 160, 0), 90, 0.78)
+	label(floorCard, {Position = UDim2.fromOffset(14, 12), Size = UDim2.new(1, -28, 0, 18), Font = Enum.Font.GothamBold, TextSize = 15, Text = "Floor"})
+	label(floorCard, {Position = UDim2.fromOffset(14, 32), Size = UDim2.new(1, -28, 0, 14), TextSize = 10, TextColor3 = THEME.muted, key = "floor_sub"})
+
+	local CHIP_W, CHIP_H, CHIP_GAP = 50, 32, 8
+	local chipIndicator = make("Frame", {
+		Size = UDim2.fromOffset(CHIP_W, CHIP_H), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+	}, floorCard)
+	corner(chipIndicator, 9)
+	lightGradient(chipIndicator, 35)
+
+	local floorButtons = {}
+	local function chipPos(n)
+		local col, row = (n - 1) % 4, math.floor((n - 1) / 4)
+		return UDim2.fromOffset(14 + col * (CHIP_W + CHIP_GAP), 56 + row * (CHIP_H + CHIP_GAP))
+	end
+	for n = 1, 8 do
+		local b = make("TextButton", {
+			Position = chipPos(n), Size = UDim2.fromOffset(CHIP_W, CHIP_H),
+			BackgroundColor3 = THEME.tile, BackgroundTransparency = 0.1, BorderSizePixel = 0, AutoButtonColor = false,
+			Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = THEME.muted, Text = tostring(n),
+		}, floorCard)
+		corner(b, 9)
+		addPress(b)
+		b.MouseEnter:Connect(function()
+			if n ~= currentFloor then tween(b, 0.15, {BackgroundColor3 = THEME.tileHover}) end
+		end)
+		b.MouseLeave:Connect(function() tween(b, 0.2, {BackgroundColor3 = THEME.tile}) end)
+		floorButtons[n] = b
+	end
+
+	-- ===== FLOORS TAB =====
+	local TAGS = {STATS[1], STATS[2], STATS[3], STATS[4], {"brz", "Brazier", BRAZIER_COLOR}, {"shop", "Toko", SHOP_COLOR}}
+	label(floorsPage, {Position = UDim2.fromOffset(2, 0), Size = UDim2.new(1, 0, 0, 20), Font = Enum.Font.GothamBold, TextSize = 15, key = "floors_title"})
+	label(floorsPage, {Position = UDim2.fromOffset(2, 20), Size = UDim2.new(1, 0, 0, 14), TextSize = 10, TextColor3 = THEME.muted, key = "floors_sub"})
+
+	local floorScroll = make("ScrollingFrame", {
+		Position = UDim2.fromOffset(0, 44), Size = UDim2.new(1, 0, 1, -44),
+		BackgroundTransparency = 1, BorderSizePixel = 0,
+		ScrollBarThickness = 3, ScrollBarImageColor3 = THEME.dim,
+		AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), ScrollingDirection = Enum.ScrollingDirection.Y,
+	}, floorsPage)
+	make("UIListLayout", {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder}, floorScroll)
+
+	local floorRows = {}
+	for n = 1, 8 do
+		local row = make("TextButton", {
+			LayoutOrder = n, Size = UDim2.new(1, -10, 0, 54),
+			BackgroundColor3 = THEME.card, AutoButtonColor = false, Text = "", BorderSizePixel = 0,
+		}, floorScroll)
+		corner(row, 12)
+		local rowStroke = subtleStroke(row)
+		addPress(row)
+
+		local badge = make("Frame", {
+			Position = UDim2.fromOffset(12, 10), Size = UDim2.fromOffset(34, 34),
+			BackgroundColor3 = THEME.tile, BorderSizePixel = 0,
+		}, row)
+		corner(badge, 9)
+		local badgeText = label(badge, {
+			Size = UDim2.fromScale(1, 1), TextXAlignment = Enum.TextXAlignment.Center,
+			Font = Enum.Font.GothamBlack, TextSize = 15, TextColor3 = THEME.muted, Text = tostring(n),
+		})
+		label(row, {Position = UDim2.fromOffset(58, 9), Size = UDim2.new(1, -140, 0, 18), Font = Enum.Font.GothamBold, TextSize = 13, Text = "Floor " .. n})
+
+		local tags = make("Frame", {Position = UDim2.fromOffset(58, 30), Size = UDim2.new(1, -140, 0, 16), BackgroundTransparency = 1}, row)
+		make("UIListLayout", {FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder}, tags)
+		for i, s in ipairs(TAGS) do
+			if FLOORS[n][s[1]] then
+				local tag = label(tags, {
+					LayoutOrder = i, Size = UDim2.fromOffset(0, 16), AutomaticSize = Enum.AutomaticSize.X,
+					BackgroundTransparency = 0.82, BackgroundColor3 = s[3],
+					Font = Enum.Font.GothamMedium, TextSize = 9, TextColor3 = s[3],
+					TextXAlignment = Enum.TextXAlignment.Center, fn = function() return L.T("k_" .. s[1]) end,
+				})
+				corner(tag, 8)
+				make("UIPadding", {PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8)}, tag)
+			end
+		end
+
+		local active = label(row, {
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -14, 0.5, 0), Size = UDim2.fromOffset(60, 16),
+			Font = Enum.Font.GothamBold, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Right,
+			TextColor3 = THEME.on, TextTransparency = 1, key = "active",
+		})
+		floorRows[n] = {row = row, stroke = rowStroke, badge = badge, badgeText = badgeText, active = active}
+	end
+
+	-- ===== TELEPORT TAB =====
+	label(tpPage, {Position = UDim2.fromOffset(2, 0), Size = UDim2.new(1, -100, 0, 20), Font = Enum.Font.GothamBold, TextSize = 15, Text = "Teleport"})
+	local tpSub = label(tpPage, {Position = UDim2.fromOffset(2, 20), Size = UDim2.new(1, -100, 0, 14), TextSize = 10, TextColor3 = THEME.muted, Text = ""})
+	local tpRefreshBtn = make("TextButton", {
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, 0, 0, 2), Size = UDim2.fromOffset(84, 28),
+		BackgroundColor3 = THEME.tile, BorderSizePixel = 0, AutoButtonColor = false,
+		Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = THEME.text, Text = "Refresh",
+	}, tpPage)
+	corner(tpRefreshBtn, 9)
+	subtleStroke(tpRefreshBtn)
+	addPress(tpRefreshBtn)
+	addHover(tpRefreshBtn, THEME.tile, THEME.tileHover)
+
+	local tpScroll = make("ScrollingFrame", {
+		Position = UDim2.fromOffset(0, 44), Size = UDim2.new(1, 0, 1, -44),
+		BackgroundTransparency = 1, BorderSizePixel = 0,
+		ScrollBarThickness = 3, ScrollBarImageColor3 = THEME.dim,
+		AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), ScrollingDirection = Enum.ScrollingDirection.Y,
+	}, tpPage)
+	make("UIListLayout", {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder}, tpScroll)
+
+	-- ===== SETTINGS TAB =====
+	local radiusCard = tintCard(settingsPage, UDim2.fromOffset(0, 0), UDim2.fromOffset(516, 90), Color3.fromRGB(0, 150, 255), 0, 0.82)
+	label(radiusCard, {Position = UDim2.fromOffset(16, 9), Size = UDim2.new(1, -32, 0, 18), Font = Enum.Font.GothamBold, TextSize = 14, key = "set_radius"})
+	label(radiusCard, {Position = UDim2.fromOffset(16, 29), Size = UDim2.new(1, -32, 0, 14), TextSize = 10, TextColor3 = THEME.muted, key = "set_radius_sub"})
+
+	local RADIUS_OPTIONS = {{"Tak terbatas", math.huge}, {"100", 100}, {"300", 300}, {"500", 500}}
+	local radiusButtons = {}
+	for i, o in ipairs(RADIUS_OPTIONS) do
+		local b = make("TextButton", {
+			Position = UDim2.fromOffset(16 + (i - 1) * 124, 50), Size = UDim2.fromOffset(116, 30),
+			BackgroundColor3 = THEME.tile, BorderSizePixel = 0, AutoButtonColor = false,
+			Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = THEME.muted, Text = (i == 1) and L.T("unlimited") or o[1],
+		}, radiusCard)
+		corner(b, 9)
+		addPress(b)
+		radiusButtons[i] = b
+		if i == 1 then L.bind(b, "Text", function() return L.T("unlimited") end) end
+	end
+	local function refreshRadius()
+		for i, b in ipairs(radiusButtons) do
+			local sel = RADIUS_OPTIONS[i][2] == RADIUS
+			tween(b, 0.25, {
+				BackgroundColor3 = sel and THEME.light or THEME.tile,
+				TextColor3 = sel and Color3.fromRGB(20, 20, 24) or THEME.muted,
+			})
+		end
+	end
+
+	local function settingRow(y, tint, title, sub)
+		local c = tintCard(settingsPage, UDim2.fromOffset(0, y), UDim2.fromOffset(516, 56), tint, 0, 0.85)
+		label(c, {Position = UDim2.fromOffset(16, 9), Size = UDim2.new(1, -140, 0, 18), Font = Enum.Font.GothamBold, TextSize = 14, key = title})
+		label(c, {Position = UDim2.fromOffset(16, 29), Size = UDim2.new(1, -140, 0, 14), TextSize = 10, TextColor3 = THEME.muted, key = sub})
+		return c
+	end
+
+	do
+		local c = tintCard(settingsPage, UDim2.fromOffset(0, 98), UDim2.fromOffset(516, 90), Color3.fromRGB(170, 90, 255), 0, 0.85)
+		label(c, {Position = UDim2.fromOffset(16, 9), Size = UDim2.new(1, -32, 0, 18), Font = Enum.Font.GothamBold, TextSize = 14, key = "set_size"})
+		label(c, {Position = UDim2.fromOffset(16, 29), Size = UDim2.new(1, -32, 0, 14), TextSize = 10, TextColor3 = THEME.muted, key = "set_size_sub"})
+		L.sizeOpts = {{"auto", nil}, {"75%", 0.75}, {"100%", 1}, {"125%", 1.25}, {"150%", 1.5}}
+		L.sizeBtns = {}
+		for i, o in ipairs(L.sizeOpts) do
+			local b = make("TextButton", {
+				Position = UDim2.fromOffset(16 + (i - 1) * 98, 50), Size = UDim2.fromOffset(90, 30),
+				BackgroundColor3 = THEME.tile, BorderSizePixel = 0, AutoButtonColor = false,
+				Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = THEME.muted, Text = o[1],
+			}, c)
+			corner(b, 9)
+			addPress(b)
+			if i == 1 then L.bind(b, "Text", function() return L.T("size_auto") end) end
+			L.sizeBtns[i] = b
+		end
+	end
+	function L.refreshSizeBtns()
+		local cur = L.userScale
+		for i, o in ipairs(L.sizeOpts) do
+			local sel = (o[2] == nil and cur == nil) or (o[2] ~= nil and cur ~= nil and math.abs(cur - o[2]) < 0.02)
+			tween(L.sizeBtns[i], 0.25, {
+				BackgroundColor3 = sel and THEME.light or THEME.tile,
+				TextColor3 = sel and Color3.fromRGB(20, 20, 24) or THEME.muted,
+			})
+		end
+	end
+	local autoPromptCard = settingRow(196, Color3.fromRGB(0, 200, 110), "set_auto", "set_auto_sub")
+	local autoPromptBtn = make("TextButton", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 5}, autoPromptCard)
+	local autoPromptSwitch = makeSwitch(autoPromptCard, UDim2.new(1, -16, 0.5, 0))
+	autoPromptSwitch.set(AUTO_PROMPT, true)
+
+	local debugCard = settingRow(260, Color3.fromRGB(255, 255, 255), "set_debug", "set_debug_sub")
+	local debugBtn = make("TextButton", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 5}, debugCard)
+	local debugSwitch = makeSwitch(debugCard, UDim2.new(1, -16, 0.5, 0))
+	debugSwitch.set(DEBUG, true)
+
+	local closeCard = settingRow(324, Color3.fromRGB(255, 70, 70), "set_stop", "set_stop_sub")
+	local stopBtn = make("TextButton", {
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -16, 0.5, 0), Size = UDim2.fromOffset(90, 32),
+		BackgroundColor3 = THEME.tile, BorderSizePixel = 0, AutoButtonColor = false,
+		Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = THEME.text, Text = "Tutup",
+	}, closeCard)
+	corner(stopBtn, 9)
+	subtleStroke(stopBtn)
+	addPress(stopBtn)
+	addHover(stopBtn, THEME.tile, THEME.tileHover)
+	L.bind(stopBtn, "Text", function() return L.T("close") end)
+
+	label(settingsPage, {
+		Position = UDim2.fromOffset(2, 388), Size = UDim2.new(1, 0, 0, 28), TextSize = 10, TextColor3 = THEME.dim, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
+		key = "hotkey",
+	})
+
+	-- ===== MOVE TAB: Fly & Noclip =====
+	do
+		local mv = pages[4]
+		label(mv, {Position = UDim2.fromOffset(2, 0), Size = UDim2.new(1, 0, 0, 20), Font = Enum.Font.GothamBold, TextSize = 15, key = "mv_title"})
+		label(mv, {Position = UDim2.fromOffset(2, 20), Size = UDim2.new(1, 0, 0, 14), TextSize = 10, TextColor3 = THEME.muted, key = "mv_sub"})
+
+		local function toggleCard(y, tint, titleText, subKey, onClick)
+			local c = tintCard(mv, UDim2.fromOffset(0, y), UDim2.fromOffset(516, 64), tint, 0, 0.7)
+			label(c, {Position = UDim2.fromOffset(16, 10), Size = UDim2.new(1, -100, 0, 20), Font = Enum.Font.GothamBold, TextSize = 15, Text = titleText})
+			label(c, {Position = UDim2.fromOffset(16, 32), Size = UDim2.new(1, -100, 0, 26), TextSize = 10, TextColor3 = THEME.muted, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, key = subKey})
+			local btn = make("TextButton", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 5}, c)
+			addPress(btn)
+			local sw = makeSwitch(c, UDim2.new(1, -16, 0.5, 0))
+			btn.Activated:Connect(onClick)
+			return sw
+		end
+
+		L.flySwitch = toggleCard(44, Color3.fromRGB(80, 160, 255), "Fly", "fly_sub", function() L.setFly(not L.fly.on) end)
+
+		-- kecepatan fly
+		local sc = tintCard(mv, UDim2.fromOffset(0, 116), UDim2.fromOffset(516, 90), Color3.fromRGB(0, 150, 255), 0, 0.85)
+		label(sc, {Position = UDim2.fromOffset(16, 9), Size = UDim2.new(1, -32, 0, 18), Font = Enum.Font.GothamBold, TextSize = 14, key = "fly_speed"})
+		label(sc, {Position = UDim2.fromOffset(16, 29), Size = UDim2.new(1, -32, 0, 14), TextSize = 10, TextColor3 = THEME.muted, key = "fly_speed_sub"})
+		L.speedOpts = {25, 50, 100, 200}
+		L.speedBtns = {}
+		for i, v in ipairs(L.speedOpts) do
+			local b = make("TextButton", {
+				Position = UDim2.fromOffset(16 + (i - 1) * 124, 50), Size = UDim2.fromOffset(112, 30),
+				BackgroundColor3 = THEME.tile, BorderSizePixel = 0, AutoButtonColor = false,
+				Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = THEME.muted, Text = tostring(v),
+			}, sc)
+			corner(b, 9)
+			addPress(b)
+			L.speedBtns[i] = b
+		end
+
+		L.ncSwitch = toggleCard(214, Color3.fromRGB(190, 110, 255), "Noclip", "nc_sub", function() L.setNoclip(not L.nc.on) end)
+
+		-- third person
+		L.tpSwitch = toggleCard(286, Color3.fromRGB(255, 170, 60), "Third Person", "tps_sub", function() L.setTP(not L.tp.on) end)
+		local dc = tintCard(mv, UDim2.fromOffset(0, 358), UDim2.fromOffset(516, 90), Color3.fromRGB(255, 150, 40), 0, 0.85)
+		label(dc, {Position = UDim2.fromOffset(16, 9), Size = UDim2.new(1, -32, 0, 18), Font = Enum.Font.GothamBold, TextSize = 14, key = "tps_dist"})
+		label(dc, {Position = UDim2.fromOffset(16, 29), Size = UDim2.new(1, -32, 0, 14), TextSize = 10, TextColor3 = THEME.muted, key = "tps_dist_sub"})
+		L.tpOpts = {8, 14, 22, 35}
+		L.tpBtns = {}
+		for i, v in ipairs(L.tpOpts) do
+			local b = make("TextButton", {
+				Position = UDim2.fromOffset(16 + (i - 1) * 124, 50), Size = UDim2.fromOffset(112, 30),
+				BackgroundColor3 = THEME.tile, BorderSizePixel = 0, AutoButtonColor = false,
+				Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = THEME.muted, Text = tostring(v),
+			}, dc)
+			corner(b, 9)
+			addPress(b)
+			L.tpBtns[i] = b
+		end
+	end
+
+	-- ---------- BUBBLE (saat di-minimize) ----------
+	local bubble = make("Frame", {
+		Position = UDim2.fromOffset(20, 160), Size = UDim2.fromOffset(48, 48),
+		BackgroundColor3 = THEME.bg, BorderSizePixel = 0, Visible = false, Active = true,
+	}, gui)
+	corner(bubble, 24)
+	local bubbleStroke = make("UIStroke", {Color = THEME.light, Thickness = 1.5, Transparency = 0.5, ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, bubble)
+	local bubbleScale = make("UIScale", {Scale = 0}, bubble)
+	-- foto profil di bubble (sama seperti avatar di menu)
+	local bubbleAv = make("ImageLabel", {
+		Size = UDim2.fromScale(1, 1), BackgroundColor3 = THEME.tile, BorderSizePixel = 0,
+		Image = "", ScaleType = Enum.ScaleType.Crop,
+	}, bubble)
+	corner(bubbleAv, 24)
+	table.insert(avatarImages, bubbleAv)
+	local bubbleDot = make("Frame", {
+		Position = UDim2.new(1, -13, 1, -13), Size = UDim2.fromOffset(11, 11),
+		BackgroundColor3 = THEME.off, BorderSizePixel = 0,
+	}, bubble)
+	corner(bubbleDot, 6)
+	make("UIStroke", {Color = THEME.bg, Thickness = 2}, bubbleDot)
+
+	-- ---------- TOAST ----------
+	local toast = make("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, -100),
+		Size = UDim2.fromOffset(0, 38), AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = THEME.bg, BackgroundTransparency = 0.05, BorderSizePixel = 0,
+	}, gui)
+	corner(toast, 19)
+	make("UIPadding", {PaddingLeft = UDim.new(0, 18), PaddingRight = UDim.new(0, 18)}, toast)
+	local toastStroke = make("UIStroke", {Color = THEME.light, Thickness = 1.5, ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, toast)
+	local toastLabel = label(toast, {
+		Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X,
+		RichText = true, Font = Enum.Font.GothamBold, TextSize = 13, Text = "",
+	})
+
+	L.toastScale = make("UIScale", {Scale = math.clamp(baseScale, 0.75, 1.1)}, toast)
+	-- posisi toast aman: kalau GUI mulai dari tepi atas layar (tanpa inset), turunkan di bawah topbar/notch
+	function L.toastY()
+		local top = gui.AbsolutePosition.Y
+		return (top < 1 and 44 or 14) * L.toastScale.Scale + 10
+	end
+	local toastId = 0
+	local function showToast(text, color)
+		toastId += 1
+		local my = toastId
+		toastLabel.Text = text
+		toastStroke.Color = color
+		tween(toast, 0.5, {Position = UDim2.new(0.5, 0, 0, L.toastY())}, Enum.EasingStyle.Quint)
+		task.delay(1.8, function()
+			if my == toastId then
+				tween(toast, 0.35, {Position = UDim2.new(0.5, 0, 0, -100)}, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+			end
+		end)
+	end
+
+	-- foto profil (headshot)
+	task.spawn(function()
+		local ok, img = pcall(function()
+			return Players:GetUserThumbnailAsync(player.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+		end)
+		if ok and img then
+			for _, l in ipairs(avatarImages) do l.Image = img end
+		end
+	end)
+
+	-- ====== LOGIKA TAMPILAN ======
+	local lastCount = {mon = 0, ff = 0, off = 0, pump = 0}
+
+	local function refreshHeader()
+		local state = espOn and L.T("scanning") or L.T("standby")
+		greetSub.Text = "ESP Radar  •  " .. state
+		floorBadgeText.Text = "FLOOR " .. currentFloor
+		statusText.Text = state
+	end
+
+	local function setStat(kind, value)
+		local s = statBoxes[kind]
+		local txt = tostring(value)
+		if s.num.Text ~= txt then
+			s.num.Text = txt
+			if value ~= "–" then
+				s.scale.Scale = 1.35
+				tween(s.scale, 0.35, {Scale = 1}, Enum.EasingStyle.Back)
+			end
+		end
+	end
+
+	local function refreshStatsActive()
+		local cfg = FLOORS[currentFloor]
+		for kind, s in pairs(statBoxes) do
+			local active = cfg[kind] and true or false
+			tween(s.tile, 0.3, {BackgroundTransparency = active and 0.15 or 0.65})
+			tween(s.num, 0.3, {TextTransparency = active and 0 or 0.65})
+			s.sub.Text = active and L.T("nearby") or L.T("none")
+			setStat(kind, active and (lastCount[kind] or 0) or "–")
+		end
+	end
+
+	local function updateStats(count)
+		lastCount = count
+		local cfg = FLOORS[currentFloor]
+		for kind in pairs(statBoxes) do
+			if cfg[kind] then setStat(kind, count[kind] or 0) end
+		end
+	end
+
+	local function refreshFloorButtons(instant)
+		if instant then
+			chipIndicator.Position = chipPos(currentFloor)
+		else
+			tween(chipIndicator, 0.45, {Position = chipPos(currentFloor)}, Enum.EasingStyle.Back)
+		end
+		for n, b in pairs(floorButtons) do
+			local sel = (n == currentFloor)
+			tween(b, 0.25, {
+				BackgroundTransparency = sel and 1 or 0.1,
+				TextColor3 = sel and Color3.fromRGB(20, 20, 24) or THEME.muted,
+			})
+		end
+		for n, r in pairs(floorRows) do
+			local sel = (n == currentFloor)
+			tween(r.row, 0.25, {BackgroundColor3 = sel and THEME.tileHover or THEME.card})
+			tween(r.stroke, 0.25, {Transparency = sel and 0.7 or 0.93})
+			tween(r.active, 0.25, {TextTransparency = sel and 0 or 1})
+			tween(r.badgeText, 0.25, {TextColor3 = sel and THEME.text or THEME.muted})
+		end
+	end
+
+	local function applyToggleVisual()
+		espSwitch.set(espOn)
+		if espOn then
+			tween(espTint, 0.4, {BackgroundColor3 = THEME.on})
+			tween(statusDot, 0.3, {BackgroundColor3 = THEME.on})
+			tween(bubbleDot, 0.3, {BackgroundColor3 = THEME.on})
+			tween(statusText, 0.3, {TextColor3 = THEME.on})
+			espSub.Text = L.T("esp_on")
+			dotPulse:Play()
+		else
+			tween(espTint, 0.4, {BackgroundColor3 = Color3.fromRGB(255, 70, 70)})
+			tween(statusDot, 0.3, {BackgroundColor3 = THEME.off})
+			tween(bubbleDot, 0.3, {BackgroundColor3 = THEME.off})
+			tween(statusText, 0.3, {TextColor3 = THEME.muted})
+			espSub.Text = L.T("esp_tap")
+			dotPulse:Cancel()
+			statusDot.BackgroundTransparency = 0
+		end
+		refreshHeader()
+	end
+
+	-- ganti tab
+	local rebuildTeleportList
+	local currentTab = 1
+	local tabToken = 0
+	local function switchTab(i)
+		if i == currentTab then return end
+		local dir = i > currentTab and 1 or -1
+		currentTab = i
+		tabToken += 1
+		local my = tabToken
+		tween(tabIndicator, 0.4, {Position = UDim2.fromOffset(8, tabY(i))}, Enum.EasingStyle.Back)
+		for k, b in pairs(tabButtons) do
+			tween(b, 0.2, {TextTransparency = k == i and 0 or 0.5})
+		end
+		local travel = H - TOP
+		local pg = pages[i]
+		-- halaman lain slide keluar, halaman baru slide masuk (clip oleh area konten)
+		for _, p in ipairs(pages) do
+			if p ~= pg and p.Visible then
+				tween(p, 0.34, {Position = UDim2.fromOffset(14, 14 - dir * travel)}, Enum.EasingStyle.Quint)
+			end
+		end
+		if not pg.Visible then
+			pg.Position = UDim2.fromOffset(14, 14 + dir * travel)
+			pg.Visible = true
+		end
+		tween(pg, 0.34, {Position = PAGE_POS}, Enum.EasingStyle.Quint)
+		task.delay(0.36, function()
+			if my ~= tabToken then return end
+			for _, p in ipairs(pages) do
+				if p ~= pages[currentTab] then p.Visible = false end
+			end
+		end)
+		-- daftar teleport diisi setelah animasi hampir selesai
+		if i == 2 and rebuildTeleportList then
+			task.delay(0.3, function()
+				if my == tabToken then rebuildTeleportList(true) end
+			end)
+		end
+	end
+
+	-- minimize / buka
+	local windowOpen = true
+	local function hideWindow()
+		if not windowOpen then return end
+		windowOpen = false
+		if L.borderTween then L.borderTween:Pause() end
+		-- jendela hilang & bubble muncul di detik yang sama
+		tween(card, 0.12, {GroupTransparency = 1}, Enum.EasingStyle.Quad)
+		tween(borderStroke, 0.12, {Transparency = 1}, Enum.EasingStyle.Quad)
+		tween(scaleObj, 0.14, {Scale = baseScale * 0.7}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		bubble.Visible = true
+		tween(bubbleScale, 0.25, {Scale = 1}, Enum.EasingStyle.Quint)
+		task.delay(0.13, function()
+			if not windowOpen then win.Visible = false end
+		end)
+	end
+
+	local function showWindow()
+		if windowOpen then return end
+		windowOpen = true
+		win.Visible = true
+		if L.borderTween then L.borderTween:Play() end
+		tween(bubbleScale, 0.12, {Scale = 0}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		tween(card, 0.2, {GroupTransparency = 0}, Enum.EasingStyle.Quad)
+		tween(borderStroke, 0.3, {Transparency = 0.35})
+		tween(scaleObj, 0.3, {Scale = baseScale}, Enum.EasingStyle.Quint)
+		task.delay(0.13, function()
+			if windowOpen then bubble.Visible = false end
+		end)
+	end
+
+	-- ====== TELEPORT + AUTO PROMPT ======
+	local autoRunning = false
+	local autoToken = 0
+	local autoStatusArgs = {"auto_idle"}
+	local autoStatusLabel, autoSwitchRef
+
+	function L.autoStr() return L.T(table.unpack(autoStatusArgs)) end
+	local function setAutoStatus(...)
+		autoStatusArgs = {...}
+		if autoStatusLabel and autoStatusLabel.Parent then autoStatusLabel.Text = L.autoStr() end
+	end
+
+	local function getRoot()
+		local ch = player.Character
+		local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+		return hrp, ch
+	end
+
+	local function getBounds(target)
+		if target:IsA("Model") then
+			return target:GetBoundingBox()
+		end
+		return target.CFrame, target.Size
+	end
+
+	-- teleport ke dekat target (berdiri di lantai, menghadap target)
+	local function teleportTo(c)
+		local hrp, ch = getRoot()
+		if not hrp or not c.target:IsDescendantOf(workspace) then return false end
+		local cf, size = getBounds(c.target)
+		local center = cf.Position
+		local floorY = center.Y - size.Y / 2
+		local flat = Vector3.new(hrp.Position.X - center.X, 0, hrp.Position.Z - center.Z)
+		local dir = flat.Magnitude > 0.5 and flat.Unit or Vector3.new(0, 0, 1)
+		local radius = math.clamp(math.max(size.X, size.Z) / 2 + 4, 5, 16)
+		local dest = Vector3.new(center.X, floorY + 3, center.Z) + dir * radius
+		if c.kind == "shop" and SHOP_OFFSET then
+			local pv = c.target:IsA("Model") and c.target:GetPivot() or c.target.CFrame
+			dest = pv:PointToWorldSpace(SHOP_OFFSET)
+		end
+		ch:PivotTo(CFrame.lookAt(dest, Vector3.new(center.X, dest.Y, center.Z)))
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		return true
+	end
+
+	local function promptPos(p)
+		local par = p.Parent
+		if par and par:IsA("BasePart") then return par.Position end
+		if par and par:IsA("Attachment") then return par.WorldPosition end
+		return nil
+	end
+
+	-- cari ProximityPrompt di dalam target (deep = cari juga prompt di sekitar target)
+	local function findPrompts(target, match, deep)
+		local list = {}
+		for _, d in ipairs(target:GetDescendants()) do
+			if d:IsA("ProximityPrompt") and d.Enabled then table.insert(list, d) end
+		end
+		if #list == 0 and deep then
+			local cf = getBounds(target)
+			for _, d in ipairs(workspace:GetDescendants()) do
+				if d:IsA("ProximityPrompt") and d.Enabled then
+					local pp = promptPos(d)
+					if pp and (pp - cf.Position).Magnitude <= 15 then table.insert(list, d) end
+				end
+			end
+		end
+		if match then
+			local filtered = {}
+			for _, p in ipairs(list) do
+				if match(p) then table.insert(filtered, p) end
+			end
+			if #filtered > 0 then return filtered end
+			if #list == 1 then return list end
+			return {}
+		end
+		return list
+	end
+
+	local function triggerPrompt(prompt)
+		if typeof(fireproximityprompt) == "function" then
+			pcall(function() prompt.HoldDuration = 0 end)
+			local ok = pcall(fireproximityprompt, prompt)
+			if ok then return true end
+		end
+		-- cadangan: tekan tombol prompt lewat VirtualInputManager
+		local ok = pcall(function()
+			local vim = game:GetService("VirtualInputManager")
+			vim:SendKeyEvent(true, prompt.KeyboardKeyCode, false, game)
+			task.wait(math.max(prompt.HoldDuration, 0.05) + 0.1)
+			vim:SendKeyEvent(false, prompt.KeyboardKeyCode, false, game)
+		end)
+		return ok
+	end
+
+	local function matchTorch(p) return ((p.ActionText or "") .. " " .. (p.ObjectText or "")):lower():find("torch") ~= nil end
+	local function matchLight(p) return (p.ActionText or ""):lower():find("light") ~= nil end
+
+	local function torchTool()
+		local ch = player.Character
+		if ch then
+			for _, t in ipairs(ch:GetChildren()) do
+				if t:IsA("Tool") and t.Name:lower():find("torch") then return t, true end
+			end
+		end
+		local bp = player:FindFirstChildOfClass("Backpack")
+		if bp then
+			for _, t in ipairs(bp:GetChildren()) do
+				if t:IsA("Tool") and t.Name:lower():find("torch") then return t, false end
+			end
+		end
+		return nil
+	end
+
+	local function equipTorch()
+		local tool, equipped = torchTool()
+		if tool and not equipped then
+			local ch = player.Character
+			local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+			if hum then pcall(function() hum:EquipTool(tool) end) end
+		end
+		return tool ~= nil
+	end
+
+	local function interact(c, deep)
+		if c.kind == "ff" or c.kind == "shop" then return 0 end
+		local match = (c.kind == "brz" and matchTorch) or (c.kind == "pump" and matchLight) or nil
+		local n = 0
+		for _, p in ipairs(findPrompts(c.target, match, deep)) do
+			if triggerPrompt(p) then n += 1 end
+			task.wait(0.1)
+		end
+		return n
+	end
+
+	-- daftar target (sudah terurut) untuk satu jenis
+	local function collectTargets(kind)
+		local hrp = getRoot()
+		local out = {}
+		for _, c in pairs(candidates) do
+			if c.kind == kind and c.target:IsDescendantOf(workspace) then
+				if kind ~= "pump" or pumpkinVisible(c.target) then
+					local d = hrp and (getPos(c.target) - hrp.Position).Magnitude or 0
+					table.insert(out, {c = c, dist = d})
+				end
+			end
+		end
+		if kind == "ff" then
+			table.sort(out, function(a, b)
+				local va, vb = getPos(a.c.target)[ORDER_BY], getPos(b.c.target)[ORDER_BY]
+				if va ~= vb then return va < vb end
+				return a.c.target:GetFullName() < b.c.target:GetFullName()
+			end)
+		else
+			table.sort(out, function(a, b) return a.dist < b.dist end)
+		end
+		return out
+	end
+
+	-- klik tombol Teleport di daftar
+	local function goTo(c, displayName)
+		if not teleportTo(c) then
+			showToast('<font color="#8E8E98">●</font>  ' .. esc(L.T("toast_lost")), THEME.off)
+			return
+		end
+		showToast('<font color="' .. hex(c.color) .. '">●</font>  ' .. esc(L.T("toast_tp", displayName)), c.color)
+		if AUTO_PROMPT and c.kind ~= "ff" and c.kind ~= "shop" then
+			task.wait(0.35)
+			if c.kind == "pump" then equipTorch() end
+			local n = interact(c, true)
+			if n > 0 then
+				task.wait(0.9)
+				showToast('<font color="#46DC8C">●</font>  ' .. esc(L.T("toast_prompt", displayName)), THEME.on)
+			end
+		end
+	end
+
+	-- ===== AUTO: Get Torch lalu nyalakan Pumpkin (floor 7) =====
+	local function stopAuto(msg)
+		autoToken += 1
+		autoRunning = false
+		setAutoStatus(msg or "auto_stopped")
+		if autoSwitchRef then pcall(autoSwitchRef.set, false) end
+	end
+
+	local function claimTorch()
+		local list = collectTargets("brz")
+		if #list == 0 then return false, "auto_nobrz" end
+		local c = list[1].c
+		teleportTo(c)
+		task.wait(0.4)
+		for _ = 1, 3 do
+			for _, p in ipairs(findPrompts(c.target, matchTorch, true)) do
+				triggerPrompt(p)
+				task.wait(0.1)
+			end
+			task.wait(0.7)
+			if torchTool() then equipTorch() break end
+		end
+		return true
+	end
+
+	local function startAuto()
+		if autoRunning then return end
+		autoToken += 1
+		local myToken = autoToken
+		autoRunning = true
+		setAutoStatus("auto_start")
+		task.spawn(function()
+			local floorAtStart = currentFloor
+			buildCandidates(true)
+			local lastBuild = os.clock()
+			local claimed, torchSeen = false, false
+			local attempts = {}
+			local function alive() return autoRunning and myToken == autoToken and currentFloor == floorAtStart and gui.Parent end
+
+			while alive() do
+				if os.clock() - lastBuild > 4 then
+					buildCandidates(true)
+					lastBuild = os.clock()
+				end
+
+				local targets = {}
+				for _, t in ipairs(collectTargets("pump")) do
+					if (attempts[t.c.target] or 0) < 3 and #findPrompts(t.c.target, matchLight, false) > 0 then
+						table.insert(targets, t)
+					end
+				end
+
+				if #targets == 0 then
+					setAutoStatus("auto_wait")
+					task.wait(1)
+				else
+					local tool = torchTool()
+					if tool then torchSeen = true end
+					if not claimed or (torchSeen and not tool) then
+						setAutoStatus("auto_torch")
+						claimed = true
+						local ok, note = claimTorch()
+						if not ok then
+							if myToken == autoToken then stopAuto(note) end
+							return
+						end
+					end
+					equipTorch()
+					for i, t in ipairs(targets) do
+						if not alive() then break end
+						setAutoStatus("auto_light", i, #targets)
+						if teleportTo(t.c) then
+							task.wait(0.3)
+							attempts[t.c.target] = (attempts[t.c.target] or 0) + 1
+							interact(t.c, false)
+							task.wait(0.45)
+						end
+					end
+				end
+			end
+			if myToken == autoToken then stopAuto("auto_stopped") end
+		end)
+	end
+
+	-- ===== daftar teleport (dibuat ulang sesuai floor) =====
+	local tpOrder = 0
+	local function nextOrder() tpOrder += 1 return tpOrder end
+
+	local function addSection(text)
+		label(tpScroll, {
+			LayoutOrder = nextOrder(), Size = UDim2.new(1, -10, 0, 16),
+			Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = THEME.muted, Text = text,
+		})
+	end
+
+	local function addEmpty()
+		label(tpScroll, {
+			LayoutOrder = nextOrder(), Size = UDim2.new(1, -10, 0, 40), TextWrapped = true,
+			TextSize = 11, TextColor3 = THEME.dim, TextYAlignment = Enum.TextYAlignment.Top,
+			Text = L.T((L.building or L.tpRefreshing or not L.builtOnce) and "scanning_list" or "empty"),
+		})
+	end
+
+	local function addTpRow(t, idx, total)
+		local c = t.c
+		local name = L.cname(c)
+		if c.kind ~= "ff" and total > 1 then name = name .. " #" .. idx end
+
+		local row = make("Frame", {
+			LayoutOrder = nextOrder(), Size = UDim2.new(1, -10, 0, 46),
+			BackgroundColor3 = THEME.card, BorderSizePixel = 0,
+		}, tpScroll)
+		corner(row, 12)
+		subtleStroke(row)
+		label(row, {
+			Position = UDim2.fromOffset(14, 7), Size = UDim2.new(1, -120, 0, 18), RichText = true,
+			Font = Enum.Font.GothamBold, TextSize = 13,
+			Text = '<font color="' .. hex(c.color) .. '">●</font>  ' .. esc(name),
+		})
+		label(row, {
+			Position = UDim2.fromOffset(14, 26), Size = UDim2.new(1, -120, 0, 14),
+			TextSize = 10, TextColor3 = THEME.muted, Text = L.T("dist_away", math.floor(t.dist)),
+		})
+		local btn = make("TextButton", {
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0), Size = UDim2.fromOffset(84, 28),
+			BackgroundColor3 = THEME.light, BorderSizePixel = 0, AutoButtonColor = false,
+			Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = Color3.fromRGB(20, 20, 24), Text = "Teleport",
+		}, row)
+		corner(btn, 9)
+		addPress(btn)
+		addHover(btn, THEME.light, Color3.new(1, 1, 1))
+		btn.Activated:Connect(function()
+			task.spawn(goTo, c, name)
+		end)
+	end
+
+	local function addAutoCard()
+		local card2 = tintCard(tpScroll, UDim2.new(), UDim2.new(1, -10, 0, 66), Color3.fromRGB(255, 150, 0), 0, 0.6)
+		card2.LayoutOrder = nextOrder()
+		label(card2, {Position = UDim2.fromOffset(16, 10), Size = UDim2.new(1, -100, 0, 18), Font = Enum.Font.GothamBold, TextSize = 14, Text = "Auto Torch & Light"})
+		autoStatusLabel = label(card2, {
+			Position = UDim2.fromOffset(16, 30), Size = UDim2.new(1, -100, 0, 30),
+			TextSize = 10, TextColor3 = THEME.muted, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
+			Text = L.autoStr(),
+		})
+		local btn = make("TextButton", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 5}, card2)
+		addPress(btn)
+		autoSwitchRef = makeSwitch(card2, UDim2.new(1, -16, 0.5, 0))
+		autoSwitchRef.set(autoRunning, true)
+		btn.Activated:Connect(function()
+			if autoRunning then
+				stopAuto("auto_stopped")
+				showToast('<font color="#8E8E98">●</font>  ' .. esc(L.T("toast_auto_off")), THEME.off)
+			else
+				autoSwitchRef.set(true)
+				startAuto()
+				showToast('<font color="#46DC8C">●</font>  ' .. esc(L.T("toast_auto_on")), THEME.on)
+			end
+		end)
+	end
+
+	function L.render(keepScroll)
+		local savedY = tpScroll.CanvasPosition
+		for _, ch in ipairs(tpScroll:GetChildren()) do
+			if not ch:IsA("UIListLayout") then ch:Destroy() end
+		end
+		autoStatusLabel, autoSwitchRef = nil, nil
+		tpOrder = 0
+
+		local cfg = FLOORS[currentFloor]
+		tpSub.Text = L.T("tp_sub", currentFloor)
+
+		if cfg.brz and cfg.pump then addAutoCard() end
+
+		local total = 0
+		for _, sec in ipairs({{"shop", "TOKO"}, {"brz", "BRAZIER"}, {"pump", "PUMPKIN"}, {"off", "OFFERING"}, {"ff", "PINTU"}}) do
+			if cfg[sec[1]] then
+				local list = collectTargets(sec[1])
+				if #list > 0 then
+					addSection(L.T("sec_" .. sec[1]) .. "  (" .. #list .. ")")
+					for i, t in ipairs(list) do addTpRow(t, i, #list) end
+					total += #list
+				end
+			end
+		end
+		if total == 0 then addEmpty() end
+		if keepScroll then
+			task.defer(function() tpScroll.CanvasPosition = savedY end)
+		end
+	end
+
+	rebuildTeleportList = function(refresh)
+		if refresh then L.tpRefreshing = true end
+		L.render(not refresh)        -- tampil langsung dari data yang ada
+		if refresh then
+			L.tpToken += 1
+			local my = L.tpToken
+			task.spawn(function()
+				buildCandidates(true)            -- scan ulang di background (bertahap)
+				if my == L.tpToken then
+					L.tpRefreshing = false
+					L.render(true)       -- segarkan jarak & daftar
+				end
+			end)
+		end
+	end
+
+	-- ====== SCAN ======
+	local function scan()
+		if L.building then return end
+		local char = player.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if not hrp then return end
+
+		local cfg = FLOORS[currentFloor]
+		local found = {}
+		local count = {ff = 0, off = 0, mon = 0, pump = 0, brz = 0, shop = 0}
+
+		for key, c in pairs(candidates) do
+			if not c.target:IsDescendantOf(workspace) then
+				candidates[key] = nil
+				removeItem(key, true)
+			elseif cfg[c.kind] and (c.kind ~= "shop" or SHOP_ESP) then
+				if c.kind == "pump" and not pumpkinVisible(c.target) then
+					-- tidak dimasukkan ke found, jadi ESP-nya otomatis dicabut
+				else
+					if not c.adornee or not c.adornee:IsDescendantOf(workspace) then
+						c.adornee = firstPart(c.target)
+					end
+					local dist = (getPos(c.target) - hrp.Position).Magnitude
+					if dist <= RADIUS and c.adornee then
+						table.insert(found, {key = key, c = c, dist = dist})
+						count[c.kind] += 1
+					end
+				end
+			end
+		end
+
+		table.sort(found, function(a, b) return a.dist < b.dist end)
+
+		local keep = {}
+		for i = 1, math.min(#found, MAX_ESP) do
+			local f = found[i]
+			keep[f.key] = true
+			if not items[f.key] then addItem(f.key, f.c) end
+
+			local it = items[f.key]
+			local txt = labelText(f.c, math.floor(f.dist))
+			if it.text ~= txt then
+				it.text = txt
+				it.label.Text = txt
+			end
+			it.stroke.Color = f.c.color
+			it.hl.FillColor = f.c.color
+			if it.box then it.box.Color3 = f.c.color end
+		end
+
+		for key in pairs(items) do
+			if not keep[key] then removeItem(key) end
+		end
+
+		updateStats(count)
+	end
+
+	local function setESP(state)
+		espOn = state
+		runId += 1
+		local myId = runId
+		if espOn then
+			addedConn = workspace.DescendantAdded:Connect(function(obj)
+				task.wait()
+				if register(obj) then relabel() end
+			end)
+			task.spawn(function()
+				buildCandidates()
+				while espOn and myId == runId do
+					scan()
+					task.wait(0.4)
+				end
+			end)
+		else
+			if addedConn then addedConn:Disconnect() addedConn = nil end
+			clearAll()
+		end
+	end
+
+	local function toggle()
+		setESP(not espOn)
+		applyToggleVisual()
+		if espOn then
+			showToast('<font color="#46DC8C">●</font>  ' .. esc(L.T("toast_esp_on", currentFloor)), THEME.on)
+		else
+			updateStats({mon = 0, ff = 0, off = 0, pump = 0})
+			showToast('<font color="#8E8E98">●</font>  ' .. esc(L.T("toast_esp_off")), THEME.off)
+		end
+	end
+
+	local function selectFloor(n)
+		if n == currentFloor then return end
+		stopAuto("auto_stopped")
+		currentFloor = n
+		refreshFloorButtons()
+		clearAll()
+		refreshStatsActive()
+		refreshHeader()
+		if espOn then scan() end
+		rebuildTeleportList(currentTab == 2)
+	end
+
+	local function shutdown()
+		pcall(L.setFly, false, true)
+		pcall(L.setNoclip, false, true)
+		pcall(L.setTP, false, true)
+		autoToken += 1
+		autoRunning = false
+		setESP(false)
+		for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+		table.clear(conns)
+		tween(card, 0.25, {GroupTransparency = 1})
+		tween(borderStroke, 0.25, {Transparency = 1})
+		tween(scaleObj, 0.3, {Scale = baseScale * 0.85})
+		tween(bubbleScale, 0.2, {Scale = 0})
+		task.delay(0.35, function() gui:Destroy() end)
+		if _G.ESP_SHUTDOWN == shutdown then _G.ESP_SHUTDOWN = nil end
+	end
+	_G.ESP_SHUTDOWN = shutdown
+
+	-- ====== FLY & NOCLIP ======
+	L.fly = {on = false, speed = tonumber(_G.ESP_FLYSPEED) or 50, up = false, down = false}
+	L.nc = {on = false, touched = {}}
+
+	function L.charParts()
+		local ch = player.Character
+		return ch, ch and ch:FindFirstChild("HumanoidRootPart"), ch and ch:FindFirstChildOfClass("Humanoid")
+	end
+
+	function L.refreshSpeedBtns()
+		for i, v in ipairs(L.speedOpts) do
+			local sel = (v == L.fly.speed)
+			tween(L.speedBtns[i], 0.25, {
+				BackgroundColor3 = sel and THEME.light or THEME.tile,
+				TextColor3 = sel and Color3.fromRGB(20, 20, 24) or THEME.muted,
+			})
+		end
+	end
+
+	-- tombol naik/turun untuk layar sentuh (muncul hanya saat Fly aktif)
+	L.pads = {}
+	for i, o in ipairs({{"⬆️", -34}, {"⬇️", 34}}) do
+		local b = make("TextButton", {
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -16, 0.5, o[2]), Size = UDim2.fromOffset(52, 52),
+			BackgroundColor3 = THEME.bg, BackgroundTransparency = 0.15, BorderSizePixel = 0, AutoButtonColor = false,
+			Font = Enum.Font.GothamBold, TextSize = 22, TextColor3 = THEME.text, Text = o[1], Visible = false,
+		}, gui)
+		corner(b, 26)
+		make("UIStroke", {Color = THEME.light, Thickness = 1.5, Transparency = 0.5, ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, b)
+		local key = i == 1 and "up" or "down"
+		b.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+				L.fly[key] = true
+			end
+		end)
+		b.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+				L.fly[key] = false
+			end
+		end)
+		L.pads[i] = b
+	end
+
+	function L.flyStop()
+		local f = L.fly
+		if f.conn then f.conn:Disconnect() f.conn = nil end
+		if f.bv then f.bv:Destroy() f.bv = nil end
+		if f.bg then f.bg:Destroy() f.bg = nil end
+		f.up, f.down = false, false
+		local _, hrp, hum = L.charParts()
+		if hum then hum.PlatformStand = false end
+		if hrp then hrp.AssemblyLinearVelocity = Vector3.zero end
+	end
+
+	function L.flyStart()
+		L.flyStop()
+		local _, hrp, hum = L.charParts()
+		if not (hrp and hum) then return false end
+		local f = L.fly
+		local bv = Instance.new("BodyVelocity")
+		bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+		bv.Velocity = Vector3.zero
+		bv.Parent = hrp
+		local bg = Instance.new("BodyGyro")
+		bg.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+		bg.P = 9e4
+		bg.D = 1000
+		bg.CFrame = hrp.CFrame
+		bg.Parent = hrp
+		f.bv, f.bg = bv, bg
+		hum.PlatformStand = true
+		local cur = Vector3.zero
+		f.conn = game:GetService("RunService").RenderStepped:Connect(function(dt)
+			local cam = workspace.CurrentCamera
+			if not cam or not hrp.Parent or not hum.Parent then return end
+			local look = cam.CFrame.LookVector
+			local flat = Vector3.new(look.X, 0, look.Z)
+			flat = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(0, 0, -1)
+			local move = hum.MoveDirection              -- sudah relatif kamera (keyboard & joystick HP)
+			local target = move * f.speed
+			if move.Magnitude > 0.05 then               -- arah kamera naik/turun ikut menentukan ketinggian
+				target = target + Vector3.new(0, look.Y * move:Dot(flat) * f.speed, 0)
+			end
+			local vy = 0
+			if UIS:IsKeyDown(Enum.KeyCode.Space) or f.up then vy += 1 end
+			if UIS:IsKeyDown(Enum.KeyCode.LeftShift) or UIS:IsKeyDown(Enum.KeyCode.LeftControl) or f.down then vy -= 1 end
+			target = target + Vector3.new(0, vy * f.speed, 0)
+			cur = cur:Lerp(target, math.clamp(dt * 10, 0, 1))   -- akselerasi halus
+			bv.Velocity = cur
+			bg.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + flat)
+		end)
+		return true
+	end
+
+	function L.setFly(on, silent)
+		L.fly.on = on
+		if L.flySwitch then L.flySwitch.set(on) end
+		if on then L.flyStart() else L.flyStop() end
+		for _, b in ipairs(L.pads) do b.Visible = on and UIS.TouchEnabled end
+		if not silent then
+			showToast(on and ('<font color="#46DC8C">●</font>  ' .. esc(L.T("toast_fly_on")))
+				or ('<font color="#8E8E98">●</font>  ' .. esc(L.T("toast_fly_off"))), on and THEME.on or THEME.off)
+		end
+	end
+
+	function L.setNoclip(on, silent)
+		local n = L.nc
+		n.on = on
+		if L.ncSwitch then L.ncSwitch.set(on) end
+		if on then
+			if not n.conn then
+				n.conn = game:GetService("RunService").Stepped:Connect(function()
+					local ch = player.Character
+					if not ch then return end
+					for _, d in ipairs(ch:GetDescendants()) do
+						if d:IsA("BasePart") and d.CanCollide then
+							n.touched[d] = true
+							d.CanCollide = false
+						end
+					end
+				end)
+			end
+		else
+			if n.conn then n.conn:Disconnect() n.conn = nil end
+			for part in pairs(n.touched) do
+				if part.Parent then part.CanCollide = true end
+			end
+			table.clear(n.touched)
+		end
+		if not silent then
+			showToast(on and ('<font color="#46DC8C">●</font>  ' .. esc(L.T("toast_nc_on")))
+				or ('<font color="#8E8E98">●</font>  ' .. esc(L.T("toast_nc_off"))), on and THEME.on or THEME.off)
+		end
+	end
+
+	-- ====== THIRD PERSON ======
+	L.tp = {on = false, dist = tonumber(_G.ESP_TPDIST) or 14, locking = false}
+
+	function L.refreshTPBtns()
+		for i, v in ipairs(L.tpOpts) do
+			local sel = (v == L.tp.dist)
+			tween(L.tpBtns[i], 0.25, {
+				BackgroundColor3 = sel and THEME.light or THEME.tile,
+				TextColor3 = sel and Color3.fromRGB(20, 20, 24) or THEME.muted,
+			})
+		end
+	end
+
+	-- set jarak awal: kunci zoom sebentar ke jarak pilihan, lalu lepas supaya bisa scroll/pinch
+	function L.tpZoom()
+		local t = L.tp
+		t.locking = true
+		pcall(function()
+			player.CameraMinZoomDistance = t.dist
+			player.CameraMaxZoomDistance = t.dist
+		end)
+		task.delay(0.2, function()
+			t.locking = false
+			if t.on then
+				pcall(function()
+					player.CameraMinZoomDistance = 0.5
+					player.CameraMaxZoomDistance = 128
+				end)
+			end
+		end)
+	end
+
+	function L.setTP(on, silent)
+		local t = L.tp
+		t.on = on
+		if L.tpSwitch then L.tpSwitch.set(on) end
+		if on then
+			if not t.saved then
+				t.saved = {player.CameraMode, player.CameraMinZoomDistance, player.CameraMaxZoomDistance}
+			end
+			pcall(function() player.CameraMode = Enum.CameraMode.Classic end)
+			L.tpZoom()
+			if not t.conn then
+				-- game kadang memaksa first person; tegakkan lagi tiap frame
+				t.conn = game:GetService("RunService").RenderStepped:Connect(function()
+					if not t.on then return end
+					pcall(function()
+						if player.CameraMode ~= Enum.CameraMode.Classic then
+							player.CameraMode = Enum.CameraMode.Classic
+							L.tpZoom()
+						end
+						if not t.locking then
+							if player.CameraMinZoomDistance > 0.5 then player.CameraMinZoomDistance = 0.5 end
+							if player.CameraMaxZoomDistance < 20 then player.CameraMaxZoomDistance = 128 end
+						end
+						-- putar kamera dengan mouse: bebas saat menu ditutup, atau tahan klik kanan saat menu terbuka
+						local cam = workspace.CurrentCamera
+						if cam and cam.CameraType ~= Enum.CameraType.Custom then cam.CameraType = Enum.CameraType.Custom end
+						if not UIS.TouchEnabled then
+							local free = (not windowOpen) or UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+							UIS.MouseBehavior = free and Enum.MouseBehavior.LockCenter or Enum.MouseBehavior.Default
+							UIS.MouseIconEnabled = not free
+						end
+					end)
+				end)
+			end
+		else
+			if t.conn then t.conn:Disconnect() t.conn = nil end
+			pcall(function()
+				UIS.MouseBehavior = Enum.MouseBehavior.Default
+				UIS.MouseIconEnabled = true
+			end)
+			if t.saved then
+				local sv = t.saved
+				t.saved = nil
+				pcall(function()
+					player.CameraMode = sv[1]
+					player.CameraMinZoomDistance = sv[2]
+					player.CameraMaxZoomDistance = sv[3]
+				end)
+			end
+		end
+		if not silent then
+			showToast(on and ('<font color="#46DC8C">●</font>  ' .. esc(L.T("toast_tps_on")))
+				or ('<font color="#8E8E98">●</font>  ' .. esc(L.T("toast_tps_off"))), on and THEME.on or THEME.off)
+		end
+	end
+
+	-- respawn: Fly tetap menyala
+	track(player.CharacterAdded:Connect(function(ch)
+		if not L.fly.on then return end
+		ch:WaitForChild("HumanoidRootPart", 5)
+		ch:WaitForChild("Humanoid", 5)
+		task.wait(0.3)
+		if L.fly.on then L.flyStart() end
+	end))
+
+	-- ====== GANTI BAHASA ======
+	function L.apply()
+		L.refresh()
+		refreshHeader()
+		refreshStatsActive()
+		espSub.Text = espOn and L.T("esp_on") or L.T("esp_tap")
+		if autoStatusLabel and autoStatusLabel.Parent then autoStatusLabel.Text = L.autoStr() end
+		if rebuildTeleportList then L.render(true) end
+		if espOn then task.spawn(scan) end
+	end
+
+	-- animasi ganti bahasa: HANYA teks yang memudar & muncul lagi (latar tetap), dengan efek gelombang atas -> bawah
+	function L.animateSwap()
+		local function collect()
+			local out = {}
+			for _, d in ipairs(card:GetDescendants()) do
+				if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" and d.Text:find("%a")
+					and not d.Text:find("^The Hollow") and not d:IsDescendantOf(logo) then
+					local hidden = false
+					for _, pgx in ipairs(pages) do
+						if not pgx.Visible and d:IsDescendantOf(pgx) then hidden = true break end
+					end
+					if not hidden then table.insert(out, d) end
+				end
+			end
+			return out
+		end
+		local old = collect()
+		local goal = {}
+		for _, d in ipairs(old) do
+			goal[d] = d.TextTransparency
+			tween(d, 0.12, {TextTransparency = 1}, Enum.EasingStyle.Quad)
+		end
+		task.delay(0.13, function()
+			L.apply()                                   -- teks diganti saat sedang tak terlihat
+			local seen = {}
+			local top, hgt = card.AbsolutePosition.Y, math.max(1, card.AbsoluteSize.Y)
+			for _, d in ipairs(collect()) do
+				seen[d] = true
+				local g = goal[d] or d.TextTransparency
+				d.TextTransparency = 1
+				local wave = math.clamp((d.AbsolutePosition.Y - top) / hgt, 0, 1) * 0.2
+				task.delay(wave, function()
+					if d.Parent then tween(d, 0.32, {TextTransparency = g}, Enum.EasingStyle.Quint) end
+				end)
+			end
+			for _, d in ipairs(old) do                  -- yang sempat disembunyikan tapi tak ikut lagi: kembalikan
+				if not seen[d] and d.Parent then d.TextTransparency = goal[d] end
+			end
+		end)
+	end
+
+	function L.setLang(code)
+		if code == L.lang or L.swapping then return end
+		L.swapping = true
+		task.delay(0.7, function() L.swapping = false end)
+		L.lang = code
+		_G.ESP_LANG = code
+		tween(L.ind, 0.4, {Position = UDim2.fromOffset(code == "id" and 3 or 33, 3)}, Enum.EasingStyle.Back)
+		for c, b in pairs(L.btns) do
+			tween(b, 0.2, {TextTransparency = c == code and 0 or 0.55})
+		end
+		-- fade halus: redup sebentar, ganti teks, lalu terang lagi
+		if windowOpen then L.animateSwap() else L.apply() end
+		showToast('<font color="#46DC8C">●</font>  ' .. esc(L.T("toast_lang")), THEME.on)
+	end
+
+	-- ====== SAMBUNG TOMBOL ======
+	for i, b in ipairs(L.speedBtns) do
+		b.Activated:Connect(function()
+			L.fly.speed = L.speedOpts[i]
+			_G.ESP_FLYSPEED = L.fly.speed
+			L.refreshSpeedBtns()
+		end)
+	end
+	L.refreshSpeedBtns()
+	for i, b in ipairs(L.tpBtns) do
+		b.Activated:Connect(function()
+			L.tp.dist = L.tpOpts[i]
+			_G.ESP_TPDIST = L.tp.dist
+			L.refreshTPBtns()
+			if L.tp.on then L.tpZoom() end
+		end)
+	end
+	L.refreshTPBtns()
+	for i, b in ipairs(L.sizeBtns) do
+		b.Activated:Connect(function() L.setScale(L.sizeOpts[i][2]) end)
+	end
+	L.refreshSizeBtns()
+	for code, b in pairs(L.btns) do
+		b.Activated:Connect(function() L.setLang(code) end)
+	end
+	espBtn.Activated:Connect(toggle)
+	debugBtn.Activated:Connect(function()
+		DEBUG = not DEBUG
+		debugSwitch.set(DEBUG)
+	end)
+	for i, b in ipairs(tabButtons) do
+		b.Activated:Connect(function() switchTab(i) end)
+	end
+	for n, b in pairs(floorButtons) do
+		b.Activated:Connect(function() selectFloor(n) end)
+	end
+	for n, r in pairs(floorRows) do
+		r.row.Activated:Connect(function() selectFloor(n) end)
+	end
+	for i, b in ipairs(radiusButtons) do
+		b.Activated:Connect(function()
+			RADIUS = RADIUS_OPTIONS[i][2]
+			refreshRadius()
+			if espOn then scan() end
+		end)
+	end
+	autoPromptBtn.Activated:Connect(function()
+		AUTO_PROMPT = not AUTO_PROMPT
+		autoPromptSwitch.set(AUTO_PROMPT)
+	end)
+	tpRefreshBtn.Activated:Connect(function()
+		rebuildTeleportList(true)
+	end)
+	minBtn.Activated:Connect(hideWindow)
+	closeBtn.Activated:Connect(shutdown)
+	stopBtn.Activated:Connect(shutdown)
+
+	refreshFloorButtons(true)
+	refreshStatsActive()
+	refreshRadius()
+	refreshHeader()
+
+	-- ====== DRAG (PC & HP) ======
+	local function makeDraggable(handle, target, onTap, threshold, onMove)
+		threshold = threshold or 6
+		local dragging, moved = false, false
+		local dragStart, startPos
+
+		handle.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				moved = false
+				dragStart = input.Position
+				startPos = target.Position
+			end
+		end)
+
+		track(UIS.InputChanged:Connect(function(input)
+			if not dragging then return end
+			if input.UserInputType == Enum.UserInputType.MouseMovement
+				or input.UserInputType == Enum.UserInputType.Touch then
+				local delta = input.Position - dragStart
+				if not moved and delta.Magnitude > threshold then
+					moved = true
+					if onMove then onMove(true) end
+				end
+				if moved then
+					local screen = gui.AbsoluteSize
+					local newX = math.clamp(startPos.X.Offset + delta.X, 0, math.max(0, screen.X - target.AbsoluteSize.X))
+					local newY = math.clamp(startPos.Y.Offset + delta.Y, 0, math.max(0, screen.Y - target.AbsoluteSize.Y))
+					target.Position = UDim2.fromOffset(newX, newY)
+				end
+			end
+		end))
+
+		track(UIS.InputEnded:Connect(function(input)
+			if not dragging then return end
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = false
+				if moved and onMove then onMove(false) end
+				if not moved and onTap then
+					onTap()
+				end
+			end
+		end))
+	end
+
+	makeDraggable(titleBar, win, nil, 1, function(m)
+		if L.borderTween and windowOpen then
+			if m then L.borderTween:Pause() else L.borderTween:Play() end
+		end
+	end)
+	makeDraggable(bubble, bubble, showWindow, 6)
+
+	-- ====== UKURAN OTOMATIS (ikut layar: HP, tablet, PC, rotasi layar) ======
+	function L.fit(instant)
+		local v = gui.AbsoluteSize
+		if v.X < 100 or v.Y < 100 then return end
+		baseScale = L.calcScale(v)
+		local w, h = math.floor(W * baseScale), math.floor(H * baseScale)
+		win.Size = UDim2.fromOffset(w, h)
+		if windowOpen then
+			if instant then scaleObj.Scale = baseScale else tween(scaleObj, 0.25, {Scale = baseScale}) end
+		end
+		L.toastScale.Scale = math.clamp(baseScale, 0.75, 1.1)
+		win.Position = UDim2.fromOffset(
+			math.clamp(win.Position.X.Offset, 0, math.max(0, v.X - w)),
+			math.clamp(win.Position.Y.Offset, 0, math.max(0, v.Y - h)))
+		bubble.Position = UDim2.fromOffset(
+			math.clamp(bubble.Position.X.Offset, 0, math.max(0, v.X - 48)),
+			math.clamp(bubble.Position.Y.Offset, 0, math.max(0, v.Y - 48)))
+	end
+	track(gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		task.delay(0.1, L.fit)   -- tunggu ukuran layar stabil (mis. saat rotasi)
+	end))
+	task.delay(0.8, L.fit)       -- sesuaikan sekali setelah animasi buka selesai
+
+	function L.setScale(sc, instant)
+		L.userScale = sc
+		_G.ESP_SCALE = sc
+		L.fit(instant)
+		if not instant and L.refreshSizeBtns then L.refreshSizeBtns() end
+	end
+
+	-- ====== RESIZE: tarik pojok kanan bawah (mouse & sentuh) ======
+	do
+		local grip = make("TextButton", {
+			AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -2, 1, -2), Size = UDim2.fromOffset(24, 24),
+			BackgroundTransparency = 1, Text = "", AutoButtonColor = false, ZIndex = 20,
+		}, card)
+		local dots = {}
+		for _, d in ipairs({{16, 16}, {10, 16}, {16, 10}}) do
+			local f = make("Frame", {
+				Position = UDim2.fromOffset(d[1], d[2]), Size = UDim2.fromOffset(3, 3),
+				BackgroundColor3 = THEME.muted, BackgroundTransparency = 0.45, BorderSizePixel = 0, ZIndex = 21,
+			}, grip)
+			corner(f, 2)
+			table.insert(dots, f)
+		end
+		local function glow(a)
+			for _, f in ipairs(dots) do tween(f, 0.15, {BackgroundTransparency = a}) end
+		end
+		local resizing, startPos, startScale = false, nil, 1
+		grip.MouseEnter:Connect(function() if not resizing then glow(0.1) end end)
+		grip.MouseLeave:Connect(function() if not resizing then glow(0.45) end end)
+		grip.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				resizing = true
+				startPos = input.Position
+				startScale = baseScale
+				if L.borderTween then L.borderTween:Pause() end
+				glow(0)
+			end
+		end)
+		track(UIS.InputChanged:Connect(function(input)
+			if not resizing then return end
+			if input.UserInputType ~= Enum.UserInputType.MouseMovement
+				and input.UserInputType ~= Enum.UserInputType.Touch then return end
+			local d = input.Position - startPos
+			local v = gui.AbsoluteSize
+			-- jangan melebihi tepi layar dari posisi jendela sekarang (biar tidak loncat)
+			local cap = math.min((v.X - win.Position.X.Offset) / W, (v.Y - win.Position.Y.Offset) / H, 1.6)
+			local sc = math.clamp(startScale + (d.X / W + d.Y / H) / 2, 0.4, math.max(0.4, cap))
+			L.setScale(sc, true)
+		end))
+		track(UIS.InputEnded:Connect(function(input)
+			if not resizing then return end
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				resizing = false
+				glow(0.45)
+				if L.borderTween and windowOpen then L.borderTween:Play() end
+				if L.refreshSizeBtns then L.refreshSizeBtns() end
+			end
+		end))
+	end
+
+	-- tombol E di keyboard
+	track(UIS.InputBegan:Connect(function(input, gameProcessed)
+		if gameProcessed then return end
+		if input.KeyCode == Enum.KeyCode.E then
+			toggle()
+		elseif input.KeyCode == Enum.KeyCode.Q then
+			if windowOpen then hideWindow() else showWindow() end
+		elseif input.KeyCode == Enum.KeyCode.F then
+			L.setFly(not L.fly.on)
+		elseif input.KeyCode == Enum.KeyCode.N then
+			L.setNoclip(not L.nc.on)
+		elseif input.KeyCode == Enum.KeyCode.T then
+			L.setTP(not L.tp.on)
+		end
+	end))
+end
+
+local function runEspSpeed()
+	local Players = game:GetService("Players")
+	local UIS = game:GetService("UserInputService")
+	local TweenService = game:GetService("TweenService")
+	local RunService = game:GetService("RunService")
+	local player = Players.LocalPlayer
+
+	-- kalau script dijalankan ulang, tutup versi lama dulu
+	if _G.ESPSPEED_SHUTDOWN then pcall(_G.ESPSPEED_SHUTDOWN) end
+
+	-- ====== SETTING ======
+	local MAX_ESP = 30          -- batas Highlight Roblox itu 31
+	local SCAN_EVERY = 2        -- detik antar scan ESP
+	local SPEED_OPTS = {32, 64, 100, 150}
+	local FLY_OPTS = {25, 50, 100, 200}
+	local TPS_OPTS = {8, 14, 22, 35}
+	local SIZE_OPTS = {"auto", 0.8, 1, 1.2}
+
+	local CATS = {
+		peta = {
+			name = "Peta Peta", title = "ESP Peta Peta", sub = "Tandai musuh Peta Peta",
+			color = Color3.fromRGB(255, 100, 100), tint = Color3.fromRGB(230, 70, 70),
+			match = function(o) return o:IsA("Model") and (o.Name == "EnemyModel" or o.Name == "EnemyModels") end,
+		},
+		box = {
+			name = "Box", title = "ESP Box", sub = "Tandai BoxBottom",
+			color = Color3.fromRGB(100, 255, 100), tint = Color3.fromRGB(40, 190, 110),
+			match = function(o) return o:IsA("BasePart") and o.Name == "BoxBottom" end,
+		},
+		safe = {
+			name = "Safe", title = "ESP Safe", sub = "Tandai brankas (Safe)",
+			color = Color3.fromRGB(255, 220, 60), tint = Color3.fromRGB(230, 180, 40),
+			match = function(o) return o:IsA("BasePart") and o.Name == "Meshes/safe_Safe" end,
+		},
+		doll = {
+			name = "Doll", title = "ESP Doll", sub = "Tandai kepala boneka",
+			color = Color3.fromRGB(240, 240, 244), tint = Color3.fromRGB(235, 235, 245),
+			match = function(o) return o:IsA("BasePart") and o.Name == "DollHead" end,
+		},
+		hint = {
+			name = "Hint", title = "ESP Hint", sub = "Tandai HintPaper",
+			color = Color3.fromRGB(80, 220, 255), tint = Color3.fromRGB(40, 170, 230),
+			match = function(o) return (o:IsA("BasePart") or o:IsA("Model")) and o.Name == "HintPaper" end,
+		},
+	}
+	local CAT_ORDER = {"peta", "box", "safe", "doll", "hint"}
+	-- =====================
+
+	local THEME = {
+		bg        = Color3.fromRGB(14, 14, 16),
+		side      = Color3.fromRGB(18, 18, 21),
+		card      = Color3.fromRGB(24, 24, 28),
+		tile      = Color3.fromRGB(33, 33, 38),
+		tileHover = Color3.fromRGB(44, 44, 51),
+		text      = Color3.fromRGB(240, 240, 244),
+		muted     = Color3.fromRGB(142, 142, 152),
+		dim       = Color3.fromRGB(96, 96, 106),
+		light     = Color3.fromRGB(232, 232, 238),
+		lightDark = Color3.fromRGB(150, 150, 160),
+		on        = Color3.fromRGB(70, 220, 140),
+		off       = Color3.fromRGB(110, 110, 122),
+		trackOff  = Color3.fromRGB(48, 48, 56),
+	}
+
+	local conns = {}
+	local function track(c) table.insert(conns, c) return c end
+
+	-- ====== UI KIT (sama seperti menu Hollow) ======
+	local function tween(obj, time, props, style, dir)
+		local t = TweenService:Create(obj, TweenInfo.new(time, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out), props)
+		t:Play()
+		return t
+	end
+
+	local function make(class, props, parent)
+		local o = Instance.new(class)
+		for k, v in pairs(props) do o[k] = v end
+		o.Parent = parent
+		return o
+	end
+
+	local function corner(obj, r)
+		return make("UICorner", {CornerRadius = UDim.new(0, r)}, obj)
+	end
+
+	local function subtleStroke(obj, transp)
+		return make("UIStroke", {
+			Color = Color3.new(1, 1, 1), Transparency = transp or 0.93, Thickness = 1,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		}, obj)
+	end
+
+	local function lightGradient(obj, rot)
+		return make("UIGradient", {
+			Color = ColorSequence.new(THEME.light, THEME.lightDark),
+			Rotation = rot or 0,
+		}, obj)
+	end
+
+	local function addPress(button)
+		local sc = make("UIScale", {Scale = 1}, button)
+		local function release() tween(sc, 0.3, {Scale = 1}, Enum.EasingStyle.Back) end
+		button.MouseButton1Down:Connect(function() tween(sc, 0.1, {Scale = 0.95}) end)
+		button.MouseButton1Up:Connect(release)
+		button.MouseLeave:Connect(release)
+	end
+
+	local function addHover(button, normal, hover)
+		button.MouseEnter:Connect(function() tween(button, 0.18, {BackgroundColor3 = hover}) end)
+		button.MouseLeave:Connect(function() tween(button, 0.25, {BackgroundColor3 = normal}) end)
+	end
+
+	local function esc(s)
+		return (tostring(s):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+	end
+
+	-- ====== BAHASA / LANGUAGE ======
+	local L = {lang = (_G.ESPSPD_LANG == "en") and "en" or "id", binds = {}}
+	L.STR = {
+		id = {
+			hello = "Halo, ", standby = "Standby", active = "Aktif",
+			peta_t = "ESP Peta Peta", peta_s = "Tandai musuh Peta Peta", peta_n = "Peta Peta",
+			box_t = "ESP Box", box_s = "Tandai BoxBottom", box_n = "Box",
+			safe_t = "ESP Safe", safe_s = "Tandai brankas (Safe)", safe_n = "Safe",
+			doll_t = "ESP Doll", doll_s = "Tandai kepala boneka", doll_n = "Doll",
+			hint_t = "ESP Hint", hint_s = "Tandai HintPaper di semua room", hint_n = "Hint",
+			esp_info = "ESP diperbarui otomatis tiap beberapa detik (maks %d objek terdekat).  ESP Doll berlaku untuk semua boneka.",
+			tp_sub = "Tap target atau pemain untuk pindah ke sana  •  urut dari terdekat",
+			sec_target = "TARGET", sec_players = "PEMAIN",
+			tp_empty_t = "Belum ada target. Dekati areanya lalu tekan Refresh.", tp_empty_p = "Tidak ada pemain lain di sekitar.",
+			tp_scan = "Memindai target…",
+			dist_away = "%d studs dari kamu",
+			t_fly = "Fly", fly_sub = "Terbang bebas  •  Hotkey F  •  Space naik, Shift turun (HP: tombol ⬆️⬇️)",
+			t_flyspd = "Kecepatan Fly", flyspd_sub = "Seberapa cepat kamu terbang (studs per detik)",
+			t_nc = "Noclip", nc_sub = "Tembus dinding dan objek  •  Hotkey N  •  pakai bersama Fly agar tidak jatuh",
+			t_spd = "Local Speed", spd_sub = "Kecepatan jalan, ditahan otomatis selama aktif",
+			t_spdval = "Nilai Speed", spdval_sub = "WalkSpeed yang dipakai saat Local Speed aktif",
+			t_tps = "Third Person", tps_sub = "Kamera dari belakang karakter  •  Hotkey T  •  mouse bebas saat menu ditutup (menu terbuka: tahan klik kanan)  •  scroll / pinch atur jarak",
+			t_tpsd = "Jarak Kamera", tpsd_sub = "Seberapa jauh kamera dari karakter (studs)",
+			set_title = "Setelan", set_sub = "Atur ukuran menu, atau tarik pojok kanan bawah jendela untuk resize",
+			t_size = "Ukuran UI", size_sub = "Pilih ukuran, atau tarik pojok kanan bawah jendela", auto = "Otomatis",
+			stop = "Hentikan Script",
+			hotkey = "Hotkey: Q = buka/tutup menu  •  F = Fly  •  N = Noclip  •  T = Third Person  •  geser title bar untuk memindahkan jendela",
+			toast_esp_on = "%s aktif", toast_esp_off = "%s mati",
+			toast_speed_on = "Speed aktif  •  %d", toast_speed_off = "Speed mati",
+			toast_fly_on = "Fly aktif", toast_fly_off = "Fly mati",
+			toast_nc_on = "Noclip aktif", toast_nc_off = "Noclip mati",
+			toast_tps_on = "Third Person aktif", toast_tps_off = "Third Person mati",
+			toast_tp_to = "Teleport ke %s", toast_lost = "Target hilang, tekan Refresh",
+			toast_plr_lost = "Pemain tidak ditemukan, tekan Refresh", toast_refreshed = "Daftar diperbarui",
+			toast_lang = "Bahasa: Indonesia",
+		},
+		en = {
+			hello = "Hello, ", standby = "Standby", active = "Active",
+			peta_t = "ESP Peta Peta", peta_s = "Highlight Peta Peta enemies", peta_n = "Peta Peta",
+			box_t = "ESP Box", box_s = "Highlight BoxBottom", box_n = "Box",
+			safe_t = "ESP Safe", safe_s = "Highlight safes", safe_n = "Safe",
+			doll_t = "ESP Doll", doll_s = "Highlight doll heads", doll_n = "Doll",
+			hint_t = "ESP Hint", hint_s = "Highlight HintPaper in every room", hint_n = "Hint",
+			esp_info = "ESP refreshes automatically every few seconds (max %d nearest objects).  ESP Doll applies to all dolls.",
+			tp_sub = "Tap a target or player to jump there  •  sorted by nearest",
+			sec_target = "TARGETS", sec_players = "PLAYERS",
+			tp_empty_t = "No targets yet. Get close to the area, then press Refresh.", tp_empty_p = "No other players around.",
+			tp_scan = "Scanning for targets…",
+			dist_away = "%d studs away",
+			t_fly = "Fly", fly_sub = "Free flight  •  Hotkey F  •  Space up, Shift down (mobile: ⬆️⬇️ buttons)",
+			t_flyspd = "Fly Speed", flyspd_sub = "How fast you fly (studs per second)",
+			t_nc = "Noclip", nc_sub = "Walk through walls and objects  •  Hotkey N  •  use with Fly so you don't fall",
+			t_spd = "Local Speed", spd_sub = "Walk speed, held automatically while on",
+			t_spdval = "Speed Value", spdval_sub = "WalkSpeed used while Local Speed is on",
+			t_tps = "Third Person", tps_sub = "Camera behind your character  •  Hotkey T  •  free mouse look when menu is closed (menu open: hold right-click)  •  scroll / pinch for distance",
+			t_tpsd = "Camera Distance", tpsd_sub = "How far the camera sits from your character (studs)",
+			set_title = "Settings", set_sub = "Pick a menu size, or drag the window's bottom-right corner to resize",
+			t_size = "UI Size", size_sub = "Pick a size, or drag the window's bottom-right corner", auto = "Auto",
+			stop = "Stop Script",
+			hotkey = "Hotkey: Q = show/hide menu  •  F = Fly  •  N = Noclip  •  T = Third Person  •  drag the title bar to move the window",
+			toast_esp_on = "%s on", toast_esp_off = "%s off",
+			toast_speed_on = "Speed on  •  %d", toast_speed_off = "Speed off",
+			toast_fly_on = "Fly on", toast_fly_off = "Fly off",
+			toast_nc_on = "Noclip on", toast_nc_off = "Noclip off",
+			toast_tps_on = "Third Person on", toast_tps_off = "Third Person off",
+			toast_tp_to = "Teleport to %s", toast_lost = "Target lost, press Refresh",
+			toast_plr_lost = "Player not found, press Refresh", toast_refreshed = "List refreshed",
+			toast_lang = "Language: English",
+		},
+	}
+	function L.T(k, ...)
+		local s = L.STR[L.lang][k] or L.STR.id[k] or k
+		if select("#", ...) > 0 then return string.format(s, ...) end
+		return s
+	end
+	function L.bind(obj, prop, fn)
+		obj[prop] = fn()
+		table.insert(L.binds, {obj, prop, fn})
+	end
+	function L.refresh()
+		for _, b in ipairs(L.binds) do
+			if b[1].Parent then pcall(function() b[1][b[2]] = b[3]() end) end
+		end
+	end
+
+	local function label(parent, props)
+		local p = {
+			BackgroundTransparency = 1,
+			Font = Enum.Font.Gotham,
+			TextSize = 12,
+			TextColor3 = THEME.text,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}
+		local key, fn = props.key, props.fn
+		for k, v in pairs(props) do
+			if k ~= "key" and k ~= "fn" then p[k] = v end
+		end
+		local o = make("TextLabel", p, parent)
+		if key then L.bind(o, "Text", function() return L.T(key) end)
+		elseif fn then L.bind(o, "Text", fn) end
+		return o
+	end
+
+	local function tintCard(parent, pos, size, tint, rot, strength)
+		local card = make("Frame", {Position = pos, Size = size, BackgroundColor3 = THEME.card, BorderSizePixel = 0}, parent)
+		corner(card, 14)
+		subtleStroke(card)
+		local tf = make("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = tint, BorderSizePixel = 0}, card)
+		corner(tf, 14)
+		make("UIGradient", {
+			Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, strength or 0.55),
+				NumberSequenceKeypoint.new(0.6, 0.94),
+				NumberSequenceKeypoint.new(1, 1),
+			}),
+			Rotation = rot or 0,
+		}, tf)
+		return card, tf
+	end
+
+	local function makeSwitch(parent, pos)
+		local trackF = make("Frame", {
+			AnchorPoint = Vector2.new(1, 0.5), Position = pos,
+			Size = UDim2.fromOffset(52, 28), BackgroundColor3 = THEME.trackOff, BorderSizePixel = 0,
+		}, parent)
+		corner(trackF, 14)
+		local onF = make("Frame", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = THEME.on, BackgroundTransparency = 1, BorderSizePixel = 0}, trackF)
+		corner(onF, 14)
+		local knob = make("Frame", {
+			Position = UDim2.new(0, 3, 0.5, -11), Size = UDim2.fromOffset(22, 22),
+			BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+		}, trackF)
+		corner(knob, 11)
+		local sw = {}
+		function sw.set(on, instant)
+			local kp = on and UDim2.new(0, 27, 0.5, -11) or UDim2.new(0, 3, 0.5, -11)
+			local tp = on and 0 or 1
+			if instant then
+				knob.Position = kp
+				onF.BackgroundTransparency = tp
+			else
+				tween(knob, 0.4, {Position = kp}, Enum.EasingStyle.Back)
+				tween(onF, 0.3, {BackgroundTransparency = tp})
+			end
+		end
+		return sw
+	end
+
+	local function iconButton(parent, text, pos)
+		local b = make("TextButton", {
+			AnchorPoint = Vector2.new(1, 0.5), Position = pos, Size = UDim2.fromOffset(30, 30),
+			BackgroundColor3 = THEME.tile, AutoButtonColor = false, BorderSizePixel = 0,
+			Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = THEME.muted, Text = text,
+		}, parent)
+		corner(b, 8)
+		subtleStroke(b)
+		addPress(b)
+		addHover(b, THEME.tile, THEME.tileHover)
+		return b
+	end
+
+	-- ====== STATE (dikumpulkan di tabel supaya hemat variabel lokal) ======
+	local S = {
+		alive = true, open = true, tab = 1, userScale = tonumber(_G.ESPSPD_SCALE),
+		on = {peta = false, box = false, safe = false, doll = false, hint = false},
+		active = {},           -- [objek] = Highlight buatan kita
+		sw = {},               -- switch tiap fitur
+		speed = {on = false, value = 64, orig = nil},
+		fly = {on = false, speed = tonumber(_G.ESPSPD_FLYSPEED) or 50, up = false, down = false},
+		nc = {on = false, touched = {}},
+		tps = {on = false, dist = tonumber(_G.ESPSPD_TPSDIST) or 14, locking = false},
+		avatars = {},
+		toastId = 0,
+	}
+	local UI = {pages = {}, tabBtns = {}}
+
+	local W, H, TOP, SIDE = 560, 390, 54, 72
+	local PW = W - SIDE - 28           -- lebar isi halaman
+	local PH = H - TOP - 28
+	local PAGE_POS = UDim2.fromOffset(SIDE + 14, TOP + 14)
+	local PAGE_DOWN = UDim2.fromOffset(SIDE + 14, TOP + 14 + 14)
+
+	-- ====== GUI ROOT ======
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "ESPSpeedGui"
+	mountGui(gui)
+
+	local function viewport()
+		local v = gui.AbsoluteSize
+		if v.X < 100 or v.Y < 100 then
+			local cam = workspace.CurrentCamera
+			v = cam and cam.ViewportSize or Vector2.new(1280, 720)
+		end
+		return v
+	end
+
+	local function calcScale(v)
+		local limit = math.min((v.X - 24) / W, (v.Y - 24) / H)
+		local auto = math.clamp(limit, 0.4, 1.25)
+		local maxAllowed = math.max(0.4, math.min(limit, 1.6))
+		return math.clamp(S.userScale or auto, 0.4, maxAllowed)
+	end
+
+	local vp = viewport()
+	local baseScale = calcScale(vp)
+	local winW, winH = math.floor(W * baseScale), math.floor(H * baseScale)
+
+	local win = make("Frame", {
+		Name = "ESPSpeedWindow",
+		Size = UDim2.fromOffset(winW, winH),
+		Position = UDim2.fromOffset(math.max(0, math.floor((vp.X - winW) / 2)), math.max(12, math.floor((vp.Y - winH) / 2 - 20))),
+		BackgroundTransparency = 1,
+	}, gui)
+
+	local scaler = make("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(W, H), BackgroundTransparency = 1,
+	}, win)
+	local scaleObj = make("UIScale", {Scale = baseScale * 0.85}, scaler)
+
+	-- border berputar (gaya Hollow)
+	local border = make("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1}, scaler)
+	corner(border, 18)
+	local borderStroke = make("UIStroke", {
+		Color = Color3.new(1, 1, 1), Thickness = 1.5, Transparency = 1,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	}, border)
+	local borderGrad = make("UIGradient", {
+		Color = ColorSequence.new({
+			ColorSequenceKeypoint.new(0, Color3.fromRGB(215, 215, 222)),
+			ColorSequenceKeypoint.new(0.5, Color3.fromRGB(60, 60, 68)),
+			ColorSequenceKeypoint.new(1, Color3.fromRGB(215, 215, 222)),
+		}),
+	}, borderStroke)
+	local borderTween = TweenService:Create(borderGrad, TweenInfo.new(7, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, -1), {Rotation = 360})
+	borderTween:Play()
+
+	-- CanvasGroup supaya semua isi terpotong rapi mengikuti sudut membulat
+	local card = make("CanvasGroup", {
+		Size = UDim2.fromScale(1, 1), BackgroundColor3 = THEME.bg, BorderSizePixel = 0,
+		GroupTransparency = 1, Active = true,
+	}, scaler)
+	corner(card, 18)
+
+	tween(card, 0.5, {GroupTransparency = 0})
+	tween(borderStroke, 0.7, {Transparency = 0.35})
+	tween(scaleObj, 0.6, {Scale = baseScale}, Enum.EasingStyle.Back)
+
+	-- ---------- TITLE BAR ----------
+	local titleBar = make("Frame", {Size = UDim2.new(1, 0, 0, TOP), BackgroundTransparency = 1, BorderSizePixel = 0, Active = true}, card)
+	make("Frame", {Position = UDim2.new(0, 0, 1, -1), Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.93, BorderSizePixel = 0}, titleBar)
+
+	-- LOGO (gambar)
+	local logo = make("Frame", {Position = UDim2.fromOffset(14, 9), Size = UDim2.fromOffset(36, 36), BackgroundTransparency = 1, BorderSizePixel = 0}, titleBar)
+	corner(logo, 10)
+	make("ImageLabel", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Image = logoImage(), ScaleType = Enum.ScaleType.Fit}, logo)
+	label(titleBar, {Position = UDim2.fromOffset(60, 0), Size = UDim2.fromOffset(130, TOP), Font = Enum.Font.GothamBold, TextSize = 16, Text = "PETAPETA"})
+
+	local closeBtn = iconButton(titleBar, "×", UDim2.new(1, -14, 0.5, 0))
+	local miniBtn = iconButton(titleBar, "–", UDim2.new(1, -50, 0.5, 0))
+
+	local pill = make("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -90, 0.5, 0), Size = UDim2.fromOffset(112, 30),
+		BackgroundColor3 = THEME.tile, BorderSizePixel = 0,
+	}, titleBar)
+	corner(pill, 15)
+	subtleStroke(pill)
+	local pillDot = make("Frame", {Position = UDim2.fromOffset(13, 11), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = THEME.off, BorderSizePixel = 0}, pill)
+	corner(pillDot, 4)
+	local pillText = label(pill, {Position = UDim2.fromOffset(28, 0), Size = UDim2.new(1, -32, 1, 0), Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = THEME.muted, Text = "Standby"})
+
+	-- tombol bahasa (bendera)
+	L.btns = {}
+	local langBox = make("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -212, 0.5, 0), Size = UDim2.fromOffset(70, 30),
+		BackgroundColor3 = THEME.tile, BorderSizePixel = 0,
+	}, titleBar)
+	corner(langBox, 15)
+	subtleStroke(langBox)
+	L.ind = make("Frame", {
+		Position = UDim2.fromOffset(L.lang == "id" and 3 or 35, 3), Size = UDim2.fromOffset(32, 24),
+		BackgroundColor3 = THEME.tileHover, BorderSizePixel = 0,
+	}, langBox)
+	corner(L.ind, 12)
+	subtleStroke(L.ind, 0.8)
+	for i, code in ipairs({"id", "en"}) do
+		local b = make("TextButton", {
+			Position = UDim2.fromOffset(i == 1 and 3 or 35, 3), Size = UDim2.fromOffset(32, 24), BackgroundTransparency = 1,
+			AutoButtonColor = false, Font = Enum.Font.Gotham, TextSize = 15, ZIndex = 2,
+			TextColor3 = THEME.text, TextTransparency = code == L.lang and 0 or 0.55,
+			Text = code == "id" and "🇮🇩" or "🇬🇧",
+		}, langBox)
+		addPress(b)
+		L.btns[code] = b
+	end
+
+	-- ---------- SIDEBAR ----------
+	local sidebar = make("Frame", {Position = UDim2.fromOffset(0, TOP), Size = UDim2.new(0, SIDE, 1, -TOP), BackgroundColor3 = THEME.side, BorderSizePixel = 0}, card)
+	make("Frame", {Position = UDim2.new(1, -1, 0, 0), Size = UDim2.new(0, 1, 1, 0), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.93, BorderSizePixel = 0}, sidebar)
+
+	local TABS = {{"👁", "ESP"}, {"📍", "Teleport"}, {"🚀", "Gerak"}, {"⚙️", "Setelan"}}
+	local function tabY(i) return 14 + (i - 1) * 52 end
+
+	UI.indicator = make("Frame", {Position = UDim2.fromOffset(0, tabY(1) + 10), Size = UDim2.fromOffset(3, 24), BackgroundColor3 = THEME.light, BorderSizePixel = 0}, sidebar)
+	corner(UI.indicator, 2)
+
+	for i, t in ipairs(TABS) do
+		local b = make("TextButton", {
+			Position = UDim2.fromOffset(12, tabY(i)), Size = UDim2.fromOffset(SIDE - 24, 44),
+			BackgroundColor3 = THEME.tile, BackgroundTransparency = i == 1 and 0 or 1, BorderSizePixel = 0, AutoButtonColor = false,
+			Font = Enum.Font.GothamBold, TextSize = 20, TextColor3 = THEME.text, TextTransparency = i == 1 and 0 or 0.45, Text = t[1],
+		}, sidebar)
+		corner(b, 12)
+		if i == 1 then subtleStroke(b) end
+		addPress(b)
+		UI.tabBtns[i] = b
+	end
+
+	-- avatar kecil di bawah sidebar
+	local sbAv = make("Frame", {AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -12), Size = UDim2.fromOffset(44, 44), BackgroundColor3 = THEME.tile, BorderSizePixel = 0}, sidebar)
+	corner(sbAv, 22)
+	subtleStroke(sbAv, 0.8)
+	local sbAvImg = make("ImageLabel", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Image = "", ScaleType = Enum.ScaleType.Crop}, sbAv)
+	corner(sbAvImg, 22)
+	table.insert(S.avatars, sbAvImg)
+
+	-- ---------- PAGES (fade + geser halus) ----------
+	for i = 1, #TABS do
+		local g = make("CanvasGroup", {
+			Position = i == 1 and PAGE_POS or PAGE_DOWN, Size = UDim2.fromOffset(PW, PH),
+			BackgroundTransparency = 1, GroupTransparency = i == 1 and 0 or 1, Visible = i == 1,
+		}, card)
+		local sc = make("ScrollingFrame", {
+			Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
+			ScrollBarThickness = 3, ScrollBarImageColor3 = THEME.dim,
+			AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(),
+			ScrollingDirection = Enum.ScrollingDirection.Y, ElasticBehavior = Enum.ElasticBehavior.Never,
+		}, g)
+		UI.pages[i] = {group = g, scroll = sc}
+	end
+
+	-- ---------- TOAST ----------
+	local toast = make("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, -100),
+		Size = UDim2.fromOffset(0, 38), AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundColor3 = THEME.bg, BackgroundTransparency = 0.05, BorderSizePixel = 0,
+	}, gui)
+	corner(toast, 19)
+	make("UIPadding", {PaddingLeft = UDim.new(0, 18), PaddingRight = UDim.new(0, 18)}, toast)
+	local toastStroke = make("UIStroke", {Color = THEME.light, Thickness = 1.5, ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, toast)
+	local toastLabel = label(toast, {Size = UDim2.new(0, 0, 1, 0), AutomaticSize = Enum.AutomaticSize.X, RichText = true, Font = Enum.Font.GothamBold, TextSize = 13, Text = ""})
+	local toastScale = make("UIScale", {Scale = math.clamp(baseScale, 0.75, 1.1)}, toast)
+
+	local function toastY()
+		local top = gui.AbsolutePosition.Y
+		return (top < 1 and 44 or 14) * toastScale.Scale + 10
+	end
+
+	local function showToast(text, isOn)
+		local color = isOn and THEME.on or THEME.off
+		local dot = '<font color="' .. (isOn and "#46DC8C" or "#8E8E98") .. '">●</font>  '
+		S.toastId += 1
+		local my = S.toastId
+		toastLabel.Text = dot .. esc(text)
+		toastStroke.Color = color
+		tween(toast, 0.5, {Position = UDim2.new(0.5, 0, 0, toastY())}, Enum.EasingStyle.Quint)
+		task.delay(1.8, function()
+			if my == S.toastId and S.alive then
+				tween(toast, 0.35, {Position = UDim2.new(0.5, 0, 0, -100)}, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+			end
+		end)
+	end
+
+	-- ====== HELPER KARAKTER ======
+	local function charParts()
+		local ch = player.Character
+		return ch, ch and ch:FindFirstChild("HumanoidRootPart"), ch and ch:FindFirstChildOfClass("Humanoid")
+	end
+
+	local function posOf(o)
+		if o:IsA("Model") then
+			local ok, cf = pcall(o.GetPivot, o)
+			return ok and cf.Position or nil
+		end
+		return o.Position
+	end
+
+	-- kumpulkan semua target; dibagi per beberapa frame supaya tidak nge-lag
+	local function gather(onlyOn)
+		local list = {}
+		local _, root = charParts()
+		local cam = workspace.CurrentCamera
+		local origin = root and root.Position or (cam and cam.CFrame.Position) or Vector3.zero
+		local n = 0
+		for _, o in ipairs(workspace:GetDescendants()) do
+			for _, key in ipairs(CAT_ORDER) do
+				if (not onlyOn or S.on[key]) and CATS[key].match(o) then
+					local p = posOf(o)
+					if p then list[#list + 1] = {obj = o, key = key, d = (p - origin).Magnitude} end
+					break
+				end
+			end
+			n += 1
+			if n % 1500 == 0 then task.wait() end
+		end
+		table.sort(list, function(a, b) return a.d < b.d end)
+		return list
+	end
+
+	-- ====== STATUS ======
+	local function countActive()
+		local n = 0
+		for _, hl in pairs(S.active) do
+			if hl.Parent then n += 1 end
+		end
+		return n
+	end
+
+	local function refreshStatus()
+		local anyOn = S.speed.on or S.fly.on or S.nc.on or S.tps.on
+		for _, k in ipairs(CAT_ORDER) do if S.on[k] then anyOn = true end end
+		local n = countActive()
+		local txt = L.T("standby")
+		if n > 0 then txt = L.T("active") .. "  •  " .. n
+		elseif anyOn then txt = L.T("active") end
+		pillText.Text = txt
+		tween(pillText, 0.25, {TextColor3 = anyOn and THEME.text or THEME.muted})
+		tween(pillDot, 0.25, {BackgroundColor3 = anyOn and THEME.on or THEME.off})
+		if UI.greetSub then UI.greetSub.Text = "ESP & Speed  •  " .. L.T(anyOn and "active" or "standby") end
+	end
+
+	-- ====== ESP ======
+	local function clearAll()
+		for o, hl in pairs(S.active) do
+			pcall(function() hl:Destroy() end)
+			S.active[o] = nil
+		end
+	end
+
+	local function scan()
+		local anyOn = false
+		for _, k in ipairs(CAT_ORDER) do if S.on[k] then anyOn = true end end
+		if not anyOn then
+			clearAll()
+			refreshStatus()
+			return
+		end
+		if S.scanning then S.rescan = true return end
+		S.scanning = true
+		local list = gather(true)
+		S.scanning = false
+		if not S.alive then return end
+
+		local want, cnt = {}, 0
+		for _, e in ipairs(list) do
+			if cnt >= MAX_ESP then break end
+			if S.on[e.key] and e.obj.Parent then
+				want[e.obj] = e.key
+				cnt += 1
+			end
+		end
+
+		for o, hl in pairs(S.active) do
+			if not want[o] or not o.Parent or not hl.Parent then
+				pcall(function() hl:Destroy() end)
+				S.active[o] = nil
+			end
+		end
+		for o, key in pairs(want) do
+			local c = CATS[key].color
+			local hl = S.active[o]
+			if not (hl and hl.Parent) then
+				hl = Instance.new("Highlight")
+				hl.Name = "ESPSpeedHL"
+				hl.FillTransparency = 1
+				hl.OutlineTransparency = 1
+				hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+				hl.Parent = o
+				S.active[o] = hl
+				tween(hl, 0.3, {FillTransparency = 0.35, OutlineTransparency = 0})
+			end
+			hl.FillColor = c
+			hl.OutlineColor = c
+		end
+		refreshStatus()
+
+		if S.rescan then
+			S.rescan = false
+			task.spawn(scan)
+		end
+	end
+
+	local function setESP(key, value, silent)
+		S.on[key] = value
+		if S.sw[key] then S.sw[key].set(value) end
+		task.spawn(function() pcall(scan) end)
+		refreshStatus()
+		if not silent then showToast(L.T(value and "toast_esp_on" or "toast_esp_off", L.T(key .. "_t")), value) end
+	end
+
+	-- ====== SPEED ======
+	local function setSpeed(value, silent)
+		local sp = S.speed
+		sp.on = value
+		if S.sw.speed then S.sw.speed.set(value) end
+		local _, _, h = charParts()
+		if value then
+			if h then
+				if h.WalkSpeed ~= sp.value then sp.orig = sp.orig or h.WalkSpeed end
+				h.WalkSpeed = sp.value
+			end
+		else
+			if h and sp.orig then h.WalkSpeed = sp.orig end
+			sp.orig = nil
+		end
+		refreshStatus()
+		if not silent then showToast(value and L.T("toast_speed_on", sp.value) or L.T("toast_speed_off"), value) end
+	end
+
+	-- tahan speed supaya tidak di-reset game / respawn
+	track(RunService.Heartbeat:Connect(function()
+		local sp = S.speed
+		if not sp.on then return end
+		local _, _, h = charParts()
+		if h and h.WalkSpeed ~= sp.value then
+			sp.orig = sp.orig or h.WalkSpeed
+			h.WalkSpeed = sp.value
+		end
+	end))
+
+	-- ====== FLY ======
+	local flyPads = {}
+	for i, o in ipairs({{"⬆️", -34}, {"⬇️", 34}}) do
+		local b = make("TextButton", {
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -16, 0.5, o[2]), Size = UDim2.fromOffset(52, 52),
+			BackgroundColor3 = THEME.bg, BackgroundTransparency = 0.15, BorderSizePixel = 0, AutoButtonColor = false,
+			Font = Enum.Font.GothamBold, TextSize = 22, TextColor3 = THEME.text, Text = o[1], Visible = false,
+		}, gui)
+		corner(b, 26)
+		make("UIStroke", {Color = THEME.light, Thickness = 1.5, Transparency = 0.5, ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, b)
+		local key = i == 1 and "up" or "down"
+		b.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+				S.fly[key] = true
+			end
+		end)
+		b.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+				S.fly[key] = false
+			end
+		end)
+		flyPads[i] = b
+	end
+
+	local function flyStop()
+		local f = S.fly
+		if f.conn then f.conn:Disconnect() f.conn = nil end
+		if f.bv then f.bv:Destroy() f.bv = nil end
+		if f.bg then f.bg:Destroy() f.bg = nil end
+		f.up, f.down = false, false
+		local _, hrp, hum = charParts()
+		if hum then hum.PlatformStand = false end
+		if hrp then hrp.AssemblyLinearVelocity = Vector3.zero end
+	end
+
+	local function flyStart()
+		flyStop()
+		local _, hrp, hum = charParts()
+		if not (hrp and hum) then return false end
+		local f = S.fly
+		local bv = Instance.new("BodyVelocity")
+		bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+		bv.Velocity = Vector3.zero
+		bv.Parent = hrp
+		local bg = Instance.new("BodyGyro")
+		bg.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+		bg.P = 9e4
+		bg.D = 1000
+		bg.CFrame = hrp.CFrame
+		bg.Parent = hrp
+		f.bv, f.bg = bv, bg
+		hum.PlatformStand = true
+		local cur = Vector3.zero
+		f.conn = RunService.RenderStepped:Connect(function(dt)
+			local cam = workspace.CurrentCamera
+			if not cam or not hrp.Parent or not hum.Parent then return end
+			local look = cam.CFrame.LookVector
+			local flat = Vector3.new(look.X, 0, look.Z)
+			flat = flat.Magnitude > 0.01 and flat.Unit or Vector3.new(0, 0, -1)
+			local move = hum.MoveDirection              -- sudah relatif kamera (keyboard & joystick HP)
+			local target = move * f.speed
+			if move.Magnitude > 0.05 then               -- arah kamera naik/turun ikut menentukan ketinggian
+				target = target + Vector3.new(0, look.Y * move:Dot(flat) * f.speed, 0)
+			end
+			local vy = 0
+			if UIS:IsKeyDown(Enum.KeyCode.Space) or f.up then vy += 1 end
+			if UIS:IsKeyDown(Enum.KeyCode.LeftShift) or UIS:IsKeyDown(Enum.KeyCode.LeftControl) or f.down then vy -= 1 end
+			target = target + Vector3.new(0, vy * f.speed, 0)
+			cur = cur:Lerp(target, math.clamp(dt * 10, 0, 1))   -- akselerasi halus
+			bv.Velocity = cur
+			bg.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + flat)
+		end)
+		return true
+	end
+
+	local function setFly(on, silent)
+		S.fly.on = on
+		if S.sw.fly then S.sw.fly.set(on) end
+		if on then flyStart() else flyStop() end
+		for _, b in ipairs(flyPads) do b.Visible = on and UIS.TouchEnabled end
+		refreshStatus()
+		if not silent then showToast(L.T(on and "toast_fly_on" or "toast_fly_off"), on) end
+	end
+
+	-- ====== NOCLIP ======
+	local function setNoclip(on, silent)
+		local n = S.nc
+		n.on = on
+		if S.sw.nc then S.sw.nc.set(on) end
+		if on then
+			if not n.conn then
+				n.conn = RunService.Stepped:Connect(function()
+					local ch = player.Character
+					if not ch then return end
+					for _, d in ipairs(ch:GetDescendants()) do
+						if d:IsA("BasePart") and d.CanCollide then
+							n.touched[d] = true
+							d.CanCollide = false
+						end
+					end
+				end)
+			end
+		else
+			if n.conn then n.conn:Disconnect() n.conn = nil end
+			for part in pairs(n.touched) do
+				if part.Parent then part.CanCollide = true end
+			end
+			table.clear(n.touched)
+		end
+		refreshStatus()
+		if not silent then showToast(L.T(on and "toast_nc_on" or "toast_nc_off"), on) end
+	end
+
+	-- ====== THIRD PERSON ======
+	local function tpsZoom()
+		local t = S.tps
+		t.locking = true
+		pcall(function()
+			player.CameraMinZoomDistance = t.dist
+			player.CameraMaxZoomDistance = t.dist
+		end)
+		task.delay(0.2, function()
+			t.locking = false
+			if t.on then
+				pcall(function()
+					player.CameraMinZoomDistance = 0.5
+					player.CameraMaxZoomDistance = 128
+				end)
+			end
+		end)
+	end
+
+	local function setTPS(on, silent)
+		local t = S.tps
+		t.on = on
+		if S.sw.tps then S.sw.tps.set(on) end
+		if on then
+			if not t.saved then
+				t.saved = {player.CameraMode, player.CameraMinZoomDistance, player.CameraMaxZoomDistance}
+			end
+			pcall(function() player.CameraMode = Enum.CameraMode.Classic end)
+			tpsZoom()
+			if not t.conn then
+				-- game kadang memaksa first person; tegakkan lagi tiap frame
+				t.conn = RunService.RenderStepped:Connect(function()
+					if not t.on then return end
+					pcall(function()
+						if player.CameraMode ~= Enum.CameraMode.Classic then
+							player.CameraMode = Enum.CameraMode.Classic
+							tpsZoom()
+						end
+						if not t.locking then
+							if player.CameraMinZoomDistance > 0.5 then player.CameraMinZoomDistance = 0.5 end
+							if player.CameraMaxZoomDistance < 20 then player.CameraMaxZoomDistance = 128 end
+						end
+						-- putar kamera dengan mouse: bebas saat menu ditutup, atau tahan klik kanan saat menu terbuka
+						local cam = workspace.CurrentCamera
+						if cam and cam.CameraType ~= Enum.CameraType.Custom then cam.CameraType = Enum.CameraType.Custom end
+						if not UIS.TouchEnabled then
+							local free = (not S.open) or UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+							UIS.MouseBehavior = free and Enum.MouseBehavior.LockCenter or Enum.MouseBehavior.Default
+							UIS.MouseIconEnabled = not free
+						end
+					end)
+				end)
+			end
+		else
+			if t.conn then t.conn:Disconnect() t.conn = nil end
+			pcall(function()
+				UIS.MouseBehavior = Enum.MouseBehavior.Default
+				UIS.MouseIconEnabled = true
+			end)
+			if t.saved then
+				local sv = t.saved
+				t.saved = nil
+				pcall(function()
+					player.CameraMode = sv[1]
+					player.CameraMinZoomDistance = sv[2]
+					player.CameraMaxZoomDistance = sv[3]
+				end)
+			end
+		end
+		refreshStatus()
+		if not silent then showToast(L.T(on and "toast_tps_on" or "toast_tps_off"), on) end
+	end
+
+	-- ====== TELEPORT ======
+	local function getBounds(t)
+		if t:IsA("Model") then
+			local ok, cf, size = pcall(t.GetBoundingBox, t)
+			if ok then return cf, size end
+			return t:GetPivot(), Vector3.new(4, 4, 4)
+		end
+		return t.CFrame, t.Size
+	end
+
+	local function teleportTo(t)
+		local ch, hrp = charParts()
+		if not (ch and hrp) or not t:IsDescendantOf(workspace) then return false end
+		local cf, size = getBounds(t)
+		local center = cf.Position
+		local floorY = center.Y - size.Y / 2
+		local flat = Vector3.new(hrp.Position.X - center.X, 0, hrp.Position.Z - center.Z)
+		local dir = flat.Magnitude > 0.5 and flat.Unit or Vector3.new(0, 0, 1)
+		local radius = math.clamp(math.max(size.X, size.Z) / 2 + 4, 5, 16)
+		local dest = Vector3.new(center.X, floorY + 3, center.Z) + dir * radius
+		ch:PivotTo(CFrame.lookAt(dest, Vector3.new(center.X, dest.Y, center.Z)))
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		return true
+	end
+
+	local function teleportToPlayer(p)
+		local ch, hrp = charParts()
+		local pch = p.Character
+		local phrp = pch and pch:FindFirstChild("HumanoidRootPart")
+		if not (ch and hrp and phrp) then return false end
+		ch:PivotTo(phrp.CFrame * CFrame.new(0, 0, 5))
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		return true
+	end
+
+	-- ====== PAGE 1: ESP ======
+	do
+		local pg = UI.pages[1].scroll
+		local greet = tintCard(pg, UDim2.fromOffset(0, 0), UDim2.fromOffset(PW, 64), Color3.new(1, 1, 1), 0, 0.9)
+		local avHolder = make("Frame", {Position = UDim2.fromOffset(12, 10), Size = UDim2.fromOffset(44, 44), BackgroundColor3 = THEME.tile, BorderSizePixel = 0}, greet)
+		corner(avHolder, 22)
+		local av = make("ImageLabel", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Image = "", ScaleType = Enum.ScaleType.Crop}, avHolder)
+		corner(av, 22)
+		table.insert(S.avatars, av)
+		label(greet, {Position = UDim2.fromOffset(68, 12), Size = UDim2.new(1, -80, 0, 22), Font = Enum.Font.GothamBold, TextSize = 17, TextTruncate = Enum.TextTruncate.AtEnd, fn = function() return L.T("hello") .. player.DisplayName end})
+		UI.greetSub = label(greet, {Position = UDim2.fromOffset(68, 35), Size = UDim2.new(1, -80, 0, 16), TextSize = 11, TextColor3 = THEME.muted, Text = "ESP & Speed  •  Standby"})
+
+		local colW = (PW - 12) / 2
+		for i, key in ipairs(CAT_ORDER) do
+			local col = (i - 1) % 2
+			local row = math.floor((i - 1) / 2)
+			local cat = CATS[key]
+			local full = i == #CAT_ORDER and i % 2 == 1          -- kartu terakhir (ganjil) selebar penuh
+			local cw = full and (PW - 6) or colW
+			local c = tintCard(pg, UDim2.fromOffset(col * (colW + 12), 76 + row * 84), UDim2.fromOffset(cw, 72), cat.tint, 0, 0.7)
+			label(c, {Position = UDim2.fromOffset(14, 12), Size = UDim2.new(1, -86, 0, 20), Font = Enum.Font.GothamBold, TextSize = 14, TextTruncate = Enum.TextTruncate.AtEnd, key = key .. "_t"})
+			label(c, {Position = UDim2.fromOffset(14, 34), Size = UDim2.new(1, -86, 0, 28), TextSize = 10, TextColor3 = THEME.muted, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, key = key .. "_s"})
+			local btn = make("TextButton", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 5}, c)
+			addPress(btn)
+			S.sw[key] = makeSwitch(c, UDim2.new(1, -12, 0.5, 0))
+			btn.Activated:Connect(function() setESP(key, not S.on[key]) end)
+		end
+
+		local info = tintCard(pg, UDim2.fromOffset(0, 328), UDim2.fromOffset(PW, 54), Color3.new(1, 1, 1), 0, 0.92)
+		label(info, {
+			Position = UDim2.fromOffset(14, 8), Size = UDim2.new(1, -28, 1, -16), TextSize = 10, TextColor3 = THEME.muted,
+			TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
+			fn = function() return L.T("esp_info", MAX_ESP) end,
+		})
+		make("Frame", {Position = UDim2.fromOffset(0, 390), Size = UDim2.fromOffset(1, 8), BackgroundTransparency = 1}, pg)
+	end
+
+	-- ====== PAGE 2: TELEPORT ======
+	do
+		local pg = UI.pages[2].scroll
+		label(pg, {Position = UDim2.fromOffset(2, 0), Size = UDim2.new(1, -110, 0, 20), Font = Enum.Font.GothamBold, TextSize = 15, Text = "Teleport"})
+		label(pg, {Position = UDim2.fromOffset(2, 20), Size = UDim2.new(1, -110, 0, 14), TextSize = 10, TextColor3 = THEME.muted, key = "tp_sub"})
+
+		local refreshBtn = make("TextButton", {
+			AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -4, 0, 2), Size = UDim2.fromOffset(92, 30),
+			BackgroundColor3 = THEME.light, BorderSizePixel = 0, AutoButtonColor = false,
+			Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Color3.fromRGB(20, 20, 24), Text = "Refresh",
+		}, pg)
+		corner(refreshBtn, 15)
+		addPress(refreshBtn)
+
+		local holder = make("Frame", {Position = UDim2.fromOffset(0, 46), Size = UDim2.new(1, -6, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1}, pg)
+		make("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder}, holder)
+
+		local order = 0
+		local function nextOrder() order += 1 return order end
+
+		local function addSection(text)
+			label(holder, {Size = UDim2.new(1, 0, 0, 20), LayoutOrder = nextOrder(), Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = THEME.muted, Text = text})
+		end
+		local function addEmpty(text)
+			label(holder, {Size = UDim2.new(1, 0, 0, 30), LayoutOrder = nextOrder(), TextSize = 11, TextColor3 = THEME.dim, TextWrapped = true, Text = text})
+		end
+		local function addRow(color, title, sub, onClick)
+			local b = make("TextButton", {
+				Size = UDim2.new(1, 0, 0, 46), LayoutOrder = nextOrder(), BackgroundColor3 = THEME.card,
+				BorderSizePixel = 0, AutoButtonColor = false, Text = "",
+			}, holder)
+			corner(b, 12)
+			subtleStroke(b)
+			addPress(b)
+			addHover(b, THEME.card, THEME.tile)
+			local d = make("Frame", {Position = UDim2.fromOffset(14, 19), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = color, BorderSizePixel = 0}, b)
+			corner(d, 4)
+			label(b, {Position = UDim2.fromOffset(32, 6), Size = UDim2.new(1, -130, 0, 18), Font = Enum.Font.GothamBold, TextSize = 13, TextTruncate = Enum.TextTruncate.AtEnd, Text = title})
+			label(b, {Position = UDim2.fromOffset(32, 25), Size = UDim2.new(1, -130, 0, 14), TextSize = 10, TextColor3 = THEME.muted, Text = sub})
+			label(b, {AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -14, 0.5, 0), Size = UDim2.fromOffset(80, 16), Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = THEME.dim, TextXAlignment = Enum.TextXAlignment.Right, Text = "TELEPORT"})
+			b.Activated:Connect(onClick)
+		end
+
+		-- tampilkan daftar dari cache (instan, tanpa scan)
+		function UI.render()
+			local savedY = pg.CanvasPosition
+			for _, c in ipairs(holder:GetChildren()) do
+				if not c:IsA("UIListLayout") then c:Destroy() end
+			end
+			order = 0
+			local _, hrp = charParts()
+			local origin = hrp and hrp.Position or Vector3.zero
+
+			local list = {}
+			for _, e in ipairs(S.cache or {}) do
+				if e.obj.Parent then
+					local p = posOf(e.obj)
+					if p then list[#list + 1] = {obj = e.obj, key = e.key, d = (p - origin).Magnitude} end
+				end
+			end
+			table.sort(list, function(a, b) return a.d < b.d end)
+
+			addSection(L.T("sec_target"))
+			if #list == 0 then addEmpty(L.T((S.cache == nil or S.listScanning) and "tp_scan" or "tp_empty_t")) end
+			for i = 1, math.min(#list, 40) do
+				local e = list[i]
+				local cat = CATS[e.key]
+				addRow(cat.color, L.T(e.key .. "_n"), L.T("dist_away", math.floor(e.d)), function()
+					if teleportTo(e.obj) then
+						showToast(L.T("toast_tp_to", L.T(e.key .. "_n")), true)
+					else
+						showToast(L.T("toast_lost"), false)
+					end
+				end)
+			end
+
+			local plist = {}
+			for _, p in ipairs(Players:GetPlayers()) do
+				if p ~= player then
+					local phrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+					if phrp then plist[#plist + 1] = {plr = p, d = (phrp.Position - origin).Magnitude} end
+				end
+			end
+			table.sort(plist, function(a, b) return a.d < b.d end)
+
+			addSection(L.T("sec_players"))
+			if #plist == 0 then addEmpty(L.T("tp_empty_p")) end
+			for i = 1, math.min(#plist, 30) do
+				local e = plist[i]
+				addRow(THEME.light, e.plr.DisplayName, string.format("@%s  •  %d studs", e.plr.Name, math.floor(e.d)), function()
+					if teleportToPlayer(e.plr) then
+						showToast(L.T("toast_tp_to", e.plr.DisplayName), true)
+					else
+						showToast(L.T("toast_plr_lost"), false)
+					end
+				end)
+			end
+			task.defer(function() pg.CanvasPosition = savedY end)
+		end
+
+		-- render langsung dari cache, lalu scan ulang di background
+		function UI.rebuild()
+			UI.render()
+			S.rbToken = (S.rbToken or 0) + 1
+			local my = S.rbToken
+			S.listScanning = true
+			task.spawn(function()
+				local list = gather(false)
+				if my == S.rbToken and S.alive then
+					S.cache = list
+					S.listScanning = false
+					UI.render()
+				end
+			end)
+		end
+
+		refreshBtn.Activated:Connect(function()
+			UI.rebuild()
+			showToast(L.T("toast_refreshed"), true)
+		end)
+	end
+
+	-- ====== BUILDER KARTU (halaman Gerak & Setelan) ======
+	local function toggleCard(parent, y, tint, title, sub, onClick)
+		local c = tintCard(parent, UDim2.fromOffset(0, y), UDim2.fromOffset(PW - 6, 64), tint, 0, 0.7)
+		label(c, {Position = UDim2.fromOffset(16, 10), Size = UDim2.new(1, -100, 0, 20), Font = Enum.Font.GothamBold, TextSize = 15, key = title})
+		label(c, {Position = UDim2.fromOffset(16, 32), Size = UDim2.new(1, -100, 0, 26), TextSize = 10, TextColor3 = THEME.muted, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, key = sub})
+		local btn = make("TextButton", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 5}, c)
+		addPress(btn)
+		local sw = makeSwitch(c, UDim2.new(1, -16, 0.5, 0))
+		btn.Activated:Connect(onClick)
+		return sw
+	end
+
+	local function optionCard(parent, y, tint, title, sub, opts, fmt, isSel, onPick)
+		local c = tintCard(parent, UDim2.fromOffset(0, y), UDim2.fromOffset(PW - 6, 90), tint, 0, 0.85)
+		label(c, {Position = UDim2.fromOffset(16, 9), Size = UDim2.new(1, -32, 0, 18), Font = Enum.Font.GothamBold, TextSize = 14, key = title})
+		label(c, {Position = UDim2.fromOffset(16, 29), Size = UDim2.new(1, -32, 0, 14), TextSize = 10, TextColor3 = THEME.muted, key = sub})
+		local n, gap = #opts, 8
+		local bw = (PW - 6 - 32 - gap * (n - 1)) / n
+		local btns = {}
+		local function refresh()
+			for i, v in ipairs(opts) do
+				local sel = isSel(v)
+				tween(btns[i], 0.25, {
+					BackgroundColor3 = sel and THEME.light or THEME.tile,
+					TextColor3 = sel and Color3.fromRGB(20, 20, 24) or THEME.muted,
+				})
+			end
+		end
+		for i, v in ipairs(opts) do
+			local b = make("TextButton", {
+				Position = UDim2.fromOffset(16 + (i - 1) * (bw + gap), 50), Size = UDim2.fromOffset(bw, 30),
+				BackgroundColor3 = THEME.tile, BorderSizePixel = 0, AutoButtonColor = false,
+				Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = THEME.muted, Text = "",
+			}, c)
+			corner(b, 9)
+			addPress(b)
+			btns[i] = b
+			L.bind(b, "Text", function() return fmt(v) end)
+			b.Activated:Connect(function()
+				onPick(v)
+				refresh()
+			end)
+		end
+		refresh()
+		return refresh
+	end
+
+	-- ====== PAGE 3: GERAK ======
+	do
+		local pg = UI.pages[3].scroll
+		S.sw.fly = toggleCard(pg, 0, Color3.fromRGB(80, 160, 255), "t_fly", "fly_sub", function() setFly(not S.fly.on) end)
+		optionCard(pg, 72, Color3.fromRGB(0, 150, 255), "t_flyspd", "flyspd_sub", FLY_OPTS, tostring,
+			function(v) return v == S.fly.speed end,
+			function(v) S.fly.speed = v _G.ESPSPD_FLYSPEED = v end)
+		S.sw.nc = toggleCard(pg, 170, Color3.fromRGB(190, 110, 255), "t_nc", "nc_sub", function() setNoclip(not S.nc.on) end)
+		S.sw.speed = toggleCard(pg, 242, Color3.fromRGB(80, 120, 255), "t_spd", "spd_sub", function() setSpeed(not S.speed.on) end)
+		optionCard(pg, 314, Color3.fromRGB(80, 120, 255), "t_spdval", "spdval_sub", SPEED_OPTS, tostring,
+			function(v) return v == S.speed.value end,
+			function(v) S.speed.value = v if S.speed.on then setSpeed(true, true) end end)
+		S.sw.tps = toggleCard(pg, 412, Color3.fromRGB(255, 170, 60), "t_tps", "tps_sub", function() setTPS(not S.tps.on) end)
+		optionCard(pg, 484, Color3.fromRGB(255, 150, 40), "t_tpsd", "tpsd_sub", TPS_OPTS, tostring,
+			function(v) return v == S.tps.dist end,
+			function(v) S.tps.dist = v _G.ESPSPD_TPSDIST = v if S.tps.on then tpsZoom() end end)
+		make("Frame", {Position = UDim2.fromOffset(0, 574), Size = UDim2.fromOffset(1, 10), BackgroundTransparency = 1}, pg)
+	end
+
+	-- ====== BUBBLE (saat di-minimize) ======
+	local bubble = make("Frame", {
+		Position = UDim2.fromOffset(20, 160), Size = UDim2.fromOffset(48, 48),
+		BackgroundColor3 = THEME.bg, BorderSizePixel = 0, Visible = false, Active = true,
+	}, gui)
+	corner(bubble, 24)
+	make("UIStroke", {Color = THEME.light, Thickness = 1.5, Transparency = 0.5, ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, bubble)
+	local bubbleScale = make("UIScale", {Scale = 0}, bubble)
+	local bubbleAv = make("ImageLabel", {Size = UDim2.fromScale(1, 1), BackgroundColor3 = THEME.tile, BorderSizePixel = 0, Image = "", ScaleType = Enum.ScaleType.Crop}, bubble)
+	corner(bubbleAv, 24)
+	table.insert(S.avatars, bubbleAv)
+	local bubbleDot = make("Frame", {Position = UDim2.new(1, -13, 1, -13), Size = UDim2.fromOffset(11, 11), BackgroundColor3 = THEME.off, BorderSizePixel = 0}, bubble)
+	corner(bubbleDot, 6)
+	make("UIStroke", {Color = THEME.bg, Thickness = 2}, bubbleDot)
+
+	task.spawn(function()
+		local ok, img = pcall(function()
+			return Players:GetUserThumbnailAsync(player.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+		end)
+		if ok and img and S.alive then
+			for _, l in ipairs(S.avatars) do l.Image = img end
+		end
+	end)
+
+	-- ====== FIT / SCALE ======
+	local function fit(instant)
+		local v = viewport()
+		baseScale = calcScale(v)
+		local w, h = math.floor(W * baseScale), math.floor(H * baseScale)
+		win.Size = UDim2.fromOffset(w, h)
+		if S.open then
+			if instant then scaleObj.Scale = baseScale else tween(scaleObj, 0.25, {Scale = baseScale}) end
+		end
+		toastScale.Scale = math.clamp(baseScale, 0.75, 1.1)
+		win.Position = UDim2.fromOffset(
+			math.clamp(win.Position.X.Offset, 0, math.max(0, v.X - w)),
+			math.clamp(win.Position.Y.Offset, 0, math.max(0, v.Y - h)))
+		bubble.Position = UDim2.fromOffset(
+			math.clamp(bubble.Position.X.Offset, 0, math.max(0, v.X - 48)),
+			math.clamp(bubble.Position.Y.Offset, 0, math.max(0, v.Y - 48)))
+	end
+	track(gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		task.delay(0.1, function() if S.alive then fit() end end)
+	end))
+	task.delay(0.8, function() if S.alive then fit() end end)
+
+	-- ====== PAGE 4: SETELAN ======
+	do
+		local pg = UI.pages[4].scroll
+		label(pg, {Position = UDim2.fromOffset(2, 0), Size = UDim2.new(1, 0, 0, 20), Font = Enum.Font.GothamBold, TextSize = 15, key = "set_title"})
+		label(pg, {Position = UDim2.fromOffset(2, 20), Size = UDim2.new(1, 0, 0, 14), TextSize = 10, TextColor3 = THEME.muted, key = "set_sub"})
+
+		UI.refreshSize = optionCard(pg, 44, Color3.fromRGB(150, 150, 170), "t_size", "size_sub", SIZE_OPTS,
+			function(v) return v == "auto" and L.T("auto") or (math.floor(v * 100 + 0.5) .. "%") end,
+			function(v) return (v == "auto" and S.userScale == nil) or (v ~= "auto" and S.userScale ~= nil and math.abs(S.userScale - v) < 0.02) end,
+			function(v)
+				S.userScale = (v ~= "auto") and v or nil
+				_G.ESPSPD_SCALE = S.userScale
+				fit()
+			end)
+
+		local stop = make("TextButton", {
+			Position = UDim2.fromOffset(0, 142), Size = UDim2.fromOffset(PW - 6, 44),
+			BackgroundColor3 = Color3.fromRGB(70, 28, 32), BorderSizePixel = 0, AutoButtonColor = false,
+			Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = Color3.fromRGB(255, 150, 150), Text = "",
+		}, pg)
+		L.bind(stop, "Text", function() return L.T("stop") end)
+		corner(stop, 12)
+		make("UIStroke", {Color = Color3.fromRGB(255, 90, 90), Transparency = 0.7, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, stop)
+		addPress(stop)
+		addHover(stop, Color3.fromRGB(70, 28, 32), Color3.fromRGB(94, 36, 42))
+		UI.stopBtn = stop
+
+		label(pg, {
+			Position = UDim2.fromOffset(2, 198), Size = UDim2.new(1, -6, 0, 40), TextSize = 10, TextColor3 = THEME.dim,
+			TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, key = "hotkey",
+		})
+		make("Frame", {Position = UDim2.fromOffset(0, 244), Size = UDim2.fromOffset(1, 10), BackgroundTransparency = 1}, pg)
+	end
+
+	-- ====== DRAG ======
+	local function makeDraggable(handle, target, onTap)
+		local dragging, dragStart, startPos, moved = false, nil, nil, false
+		track(handle.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				moved = false
+				dragStart = input.Position
+				startPos = target.Position
+			end
+		end))
+		track(UIS.InputChanged:Connect(function(input)
+			if not dragging then return end
+			if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+				local d = input.Position - dragStart
+				if d.Magnitude > 6 then moved = true end
+				if moved then
+					local v = viewport()
+					local sz = target.AbsoluteSize
+					target.Position = UDim2.fromOffset(
+						math.clamp(startPos.X.Offset + d.X, 0, math.max(0, v.X - sz.X)),
+						math.clamp(startPos.Y.Offset + d.Y, 0, math.max(0, v.Y - sz.Y)))
+				end
+			end
+		end))
+		track(UIS.InputEnded:Connect(function(input)
+			if not dragging then return end
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = false
+				if not moved and onTap then onTap() end
+			end
+		end))
+	end
+
+	-- ====== RESIZE: tarik pojok kanan bawah ======
+	do
+		local grip = make("TextButton", {
+			AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -2, 1, -2), Size = UDim2.fromOffset(24, 24),
+			BackgroundTransparency = 1, Text = "", AutoButtonColor = false, ZIndex = 20,
+		}, card)
+		local dots = {}
+		for _, d in ipairs({{16, 16}, {10, 16}, {16, 10}}) do
+			local f = make("Frame", {
+				Position = UDim2.fromOffset(d[1], d[2]), Size = UDim2.fromOffset(3, 3),
+				BackgroundColor3 = THEME.muted, BackgroundTransparency = 0.45, BorderSizePixel = 0, ZIndex = 21,
+			}, grip)
+			corner(f, 2)
+			table.insert(dots, f)
+		end
+		local function glow(a)
+			for _, f in ipairs(dots) do tween(f, 0.15, {BackgroundTransparency = a}) end
+		end
+		local resizing, startPos, startScale = false, nil, 1
+		grip.MouseEnter:Connect(function() if not resizing then glow(0.1) end end)
+		grip.MouseLeave:Connect(function() if not resizing then glow(0.45) end end)
+		grip.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				resizing = true
+				startPos = input.Position
+				startScale = baseScale
+				borderTween:Pause()
+				glow(0)
+			end
+		end)
+		track(UIS.InputChanged:Connect(function(input)
+			if not resizing then return end
+			if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
+			local d = input.Position - startPos
+			local v = viewport()
+			local cap = math.min((v.X - win.Position.X.Offset) / W, (v.Y - win.Position.Y.Offset) / H, 1.6)
+			local sc = math.clamp(startScale + (d.X / W + d.Y / H) / 2, 0.4, math.max(0.4, cap))
+			S.userScale = sc
+			_G.ESPSPD_SCALE = sc
+			fit(true)
+		end))
+		track(UIS.InputEnded:Connect(function(input)
+			if not resizing then return end
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				resizing = false
+				glow(0.45)
+				if S.open then borderTween:Play() end
+				if UI.refreshSize then UI.refreshSize() end
+			end
+		end))
+	end
+
+	makeDraggable(titleBar, win)
+
+	-- ====== TAB SWITCH (crossfade, tanpa jeda) ======
+	local function setTab(i)
+		if i == S.tab then return end
+		local oldIdx = S.tab
+		S.tab = i
+		S.tabToken = (S.tabToken or 0) + 1
+		local my = S.tabToken
+		local dir = i > oldIdx and 1 or -1
+
+		for k, b in ipairs(UI.tabBtns) do
+			local sel = k == i
+			tween(b, 0.25, {BackgroundTransparency = sel and 0 or 1, TextTransparency = sel and 0 or 0.45})
+			local st = b:FindFirstChildOfClass("UIStroke")
+			if sel and not st then subtleStroke(b) elseif not sel and st then st:Destroy() end
+		end
+		tween(UI.indicator, 0.4, {Position = UDim2.fromOffset(0, tabY(i) + 10)}, Enum.EasingStyle.Back)
+
+		-- halaman lama: memudar sambil geser keluar
+		for k, p in ipairs(UI.pages) do
+			if k ~= i and p.group.Visible then
+				tween(p.group, 0.16, {
+					GroupTransparency = 1,
+					Position = UDim2.fromOffset(PAGE_POS.X.Offset, PAGE_POS.Y.Offset - dir * 12),
+				}, Enum.EasingStyle.Quad)
+			end
+		end
+		-- halaman baru: langsung muncul di saat yang sama
+		local new = UI.pages[i].group
+		if not new.Visible then
+			new.Position = UDim2.fromOffset(PAGE_POS.X.Offset, PAGE_POS.Y.Offset + dir * 12)
+			new.GroupTransparency = 1
+			new.Visible = true
+		end
+		tween(new, 0.3, {GroupTransparency = 0, Position = PAGE_POS}, Enum.EasingStyle.Quint)
+
+		task.delay(0.2, function()
+			if my ~= S.tabToken then return end
+			for k, p in ipairs(UI.pages) do
+				if k ~= S.tab then p.group.Visible = false end
+			end
+		end)
+
+		if i == 2 and UI.rebuild then UI.rebuild() end
+	end
+	for i, b in ipairs(UI.tabBtns) do
+		b.Activated:Connect(function() setTab(i) end)
+	end
+
+	-- ====== GANTI BAHASA ======
+	local function applyLang()
+		L.refresh()
+		refreshStatus()
+		if S.tab == 2 and UI.render then UI.render() end
+	end
+
+	-- hanya teks yang memudar lalu muncul lagi dengan efek gelombang atas -> bawah
+	local function animateSwap()
+		local function collect()
+			local out = {}
+			for _, d in ipairs(card:GetDescendants()) do
+				if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" and d.Text:find("%a")
+					and not (d:IsDescendantOf(titleBar) and d ~= pillText) then
+					local hidden = false
+					for _, p in ipairs(UI.pages) do
+						if not p.group.Visible and d:IsDescendantOf(p.group) then hidden = true break end
+					end
+					if not hidden then out[#out + 1] = d end
+				end
+			end
+			return out
+		end
+
+		local old = collect()
+		local goal = {}
+		for _, d in ipairs(old) do
+			goal[d] = d.TextTransparency
+			tween(d, 0.12, {TextTransparency = 1}, Enum.EasingStyle.Quad)
+		end
+		task.delay(0.13, function()
+			if not S.alive then return end
+			applyLang()                                   -- teks diganti saat tak terlihat
+			local seen = {}
+			local top, hgt = card.AbsolutePosition.Y, math.max(1, card.AbsoluteSize.Y)
+			for _, d in ipairs(collect()) do
+				seen[d] = true
+				local g = goal[d] or d.TextTransparency
+				d.TextTransparency = 1
+				local wave = math.clamp((d.AbsolutePosition.Y - top) / hgt, 0, 1) * 0.2
+				task.delay(wave, function()
+					if d.Parent then tween(d, 0.32, {TextTransparency = g}, Enum.EasingStyle.Quint) end
+				end)
+			end
+			for _, d in ipairs(old) do                    -- yang tadi disembunyikan tapi tak ikut lagi: kembalikan
+				if not seen[d] and d.Parent then d.TextTransparency = goal[d] end
+			end
+		end)
+	end
+
+	local function setLang(code)
+		if code == L.lang or L.swapping then return end
+		L.swapping = true
+		task.delay(0.7, function() L.swapping = false end)
+		L.lang = code
+		_G.ESPSPD_LANG = code
+		tween(L.ind, 0.4, {Position = UDim2.fromOffset(code == "id" and 3 or 35, 3)}, Enum.EasingStyle.Back)
+		for c, b in pairs(L.btns) do
+			tween(b, 0.2, {TextTransparency = c == code and 0 or 0.55})
+		end
+		if S.open then animateSwap() else applyLang() end
+		showToast(L.T("toast_lang"), true)
+	end
+	for code, b in pairs(L.btns) do
+		b.Activated:Connect(function() setLang(code) end)
+	end
+
+	-- ====== SHOW / HIDE (jendela & bubble bertukar bersamaan) ======
+	local function showWindow()
+		if S.open then return end
+		S.open = true
+		win.Visible = true
+		borderTween:Play()
+		tween(bubbleScale, 0.12, {Scale = 0}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		tween(card, 0.2, {GroupTransparency = 0}, Enum.EasingStyle.Quad)
+		tween(borderStroke, 0.3, {Transparency = 0.35})
+		tween(scaleObj, 0.3, {Scale = baseScale}, Enum.EasingStyle.Quint)
+		task.delay(0.13, function()
+			if S.open then bubble.Visible = false end
+		end)
+	end
+
+	local function hideWindow()
+		if not S.open then return end
+		S.open = false
+		borderTween:Pause()
+		tween(card, 0.12, {GroupTransparency = 1}, Enum.EasingStyle.Quad)
+		tween(borderStroke, 0.12, {Transparency = 1}, Enum.EasingStyle.Quad)
+		tween(scaleObj, 0.14, {Scale = baseScale * 0.7}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+		bubble.Visible = true
+		tween(bubbleScale, 0.25, {Scale = 1}, Enum.EasingStyle.Quint)
+		task.delay(0.13, function()
+			if not S.open and S.alive then win.Visible = false end
+		end)
+	end
+
+	miniBtn.Activated:Connect(hideWindow)
+	makeDraggable(bubble, bubble, showWindow)
+
+	-- ====== HOTKEY ======
+	track(UIS.InputBegan:Connect(function(input, gp)
+		if gp then return end
+		local k = input.KeyCode
+		if k == Enum.KeyCode.Q then
+			if S.open then hideWindow() else showWindow() end
+		elseif k == Enum.KeyCode.F then
+			setFly(not S.fly.on)
+		elseif k == Enum.KeyCode.N then
+			setNoclip(not S.nc.on)
+		elseif k == Enum.KeyCode.T then
+			setTPS(not S.tps.on)
+		end
+	end))
+
+	-- ====== LOOP SCAN + RESPAWN ======
+	task.spawn(function()
+		while S.alive do
+			local anyOn = false
+			for _, k in ipairs(CAT_ORDER) do if S.on[k] then anyOn = true end end
+			if anyOn then pcall(scan) end
+			task.wait(SCAN_EVERY)
+		end
+	end)
+
+	track(player.CharacterAdded:Connect(function(ch)
+		if not (S.speed.on or S.fly.on) then return end
+		ch:WaitForChild("HumanoidRootPart", 5)
+		ch:WaitForChild("Humanoid", 5)
+		task.wait(0.3)
+		if S.speed.on then setSpeed(true, true) end
+		if S.fly.on then flyStart() end
+	end))
+
+	-- ====== SHUTDOWN ======
+	local function shutdown()
+		if not S.alive then return end
+		S.alive = false
+		pcall(setFly, false, true)
+		pcall(setNoclip, false, true)
+		pcall(setTPS, false, true)
+		pcall(function()
+			local _, _, h = charParts()
+			if h and S.speed.orig then h.WalkSpeed = S.speed.orig end
+		end)
+		clearAll()
+		for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+		table.clear(conns)
+		pcall(function() borderTween:Cancel() end)
+		tween(card, 0.25, {GroupTransparency = 1})
+		tween(borderStroke, 0.25, {Transparency = 1})
+		tween(scaleObj, 0.3, {Scale = baseScale * 0.85})
+		tween(bubbleScale, 0.2, {Scale = 0})
+		task.delay(0.35, function() gui:Destroy() end)
+		if _G.ESPSPEED_SHUTDOWN == shutdown then _G.ESPSPEED_SHUTDOWN = nil end
+	end
+	_G.ESPSPEED_SHUTDOWN = shutdown
+	closeBtn.Activated:Connect(shutdown)
+	UI.stopBtn.Activated:Connect(shutdown)
+
+	refreshStatus()
+end
+
+local function inList(list)
+	for _, id in ipairs(list) do
+		if game.PlaceId == id or game.GameId == id then return true end
+	end
+	return false
+end
+
+local choice
+if _G.FORCE_SCRIPT == "hollow" or _G.FORCE_SCRIPT == "espspeed" then
+	choice = _G.FORCE_SCRIPT
+elseif inList(HOLLOW_IDS) then
+	choice = "hollow"
+elseif inList(ESPSPD_IDS) then
+	choice = "espspeed"
+end
+
+-- log diagnosa: lihat di Developer Console (F9) > Client
+warn(("[Loader] PlaceId = %s | GameId = %s | script = %s"):format(tostring(game.PlaceId), tostring(game.GameId), tostring(choice)))
+
+if choice == "hollow" then
+	runHollow()
+elseif choice == "espspeed" then
+	runEspSpeed()
+else
+	warn("[Loader] Game belum terdaftar, tidak ada script yang dijalankan.")
+end

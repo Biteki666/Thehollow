@@ -54,7 +54,7 @@ local function runHollow()
 	local DEBUG   = true        -- true = cetak info ke Output (bisa diganti lewat tab Settings)
 	local AUTO_PROMPT = true    -- true = otomatis tekan prompt (Get Torch / Light / dll) setelah teleport
 
-	-- ISI TIAP FLOOR: mon = monster, ff = pintu, off = Offering, pump = Pumpkin
+	-- ISI TIAP FLOOR: mon = monster, ff = pintu, off = Offering, pump = Pumpkin, lever = PuzzleLever
 	local FLOORS = {
 		[1] = {mon = true, ff = true},
 		[2] = {mon = true, ff = true},
@@ -64,8 +64,14 @@ local function runHollow()
 		[6] = {mon = true, ff = true},
 		[7] = {mon = true, ff = true, pump = true, brz = true},
 		[8] = {mon = true, ff = true, off = true, shop = true},
+		[9] = {mon = true, ff = true, lever = true},
 	}
 	local DEFAULT_FLOOR = 1
+
+	-- PUZZLE LEVER (floor 9) - model bernama PuzzleLever (isi: LeverBase, LeverHandle, IconBack, IconFront)
+	local LEVER_NAME  = "PuzzleLever"
+	local LEVER_LABEL = "TUAS"
+	local LEVER_COLOR = Color3.fromRGB(255, 80, 200)
 
 	-- PUMPKIN (floor 7) - hanya yang nongol yang di-ESP
 	local PUMPKIN_NAME    = "Pumpkin"
@@ -135,12 +141,12 @@ local function runHollow()
 		id = {
 			hello = "Halo, ", standby = "Standby", scanning = "Scanning…",
 			radar_sub = "Hasil scan di sekitar kamu", nearby = "di sekitar", none = "tidak ada",
-			k_mon = "Monster", k_ff = "Pintu", k_off = "Offering", k_pump = "Pumpkin", k_brz = "Brazier", k_shop = "Toko",
+			k_mon = "Monster", k_ff = "Pintu", k_off = "Offering", k_pump = "Pumpkin", k_brz = "Brazier", k_shop = "Toko", k_lever = "Tuas",
 			esp_tap = "Tekan untuk mengaktifkan", esp_on = "Aktif — memindai objek di sekitarmu",
 			floor_sub = "Pilih lantai yang sedang kamu mainkan",
 			floors_title = "Daftar Floor", floors_sub = "Apa saja yang dilacak di tiap floor. Tap untuk memilih.", active = "AKTIF",
 			tp_sub = "Tujuan khusus Floor %d  •  diurutkan dari yang terdekat",
-			sec_shop = "TOKO", sec_brz = "BRAZIER", sec_pump = "PUMPKIN", sec_off = "OFFERING", sec_ff = "PINTU",
+			sec_shop = "TOKO", sec_brz = "BRAZIER", sec_pump = "PUMPKIN", sec_off = "OFFERING", sec_ff = "PINTU", sec_lever = "TUAS",
 			empty = "Belum ada target di floor ini. Dekati areanya lalu tekan Refresh.",
 			scanning_list = "Memindai target…", dist_away = "%d studs dari kamu",
 			auto_idle = "Ambil torch di Brazier, lalu nyalakan semua Pumpkin", auto_stopped = "Berhenti",
@@ -170,12 +176,12 @@ local function runHollow()
 		en = {
 			hello = "Hello, ", standby = "Standby", scanning = "Scanning…",
 			radar_sub = "Scan results around you", nearby = "nearby", none = "none",
-			k_mon = "Monster", k_ff = "Doors", k_off = "Offering", k_pump = "Pumpkin", k_brz = "Brazier", k_shop = "Shop",
+			k_mon = "Monster", k_ff = "Doors", k_off = "Offering", k_pump = "Pumpkin", k_brz = "Brazier", k_shop = "Shop", k_lever = "Lever",
 			esp_tap = "Tap to turn on", esp_on = "Active — scanning nearby objects",
 			floor_sub = "Pick the floor you're playing on",
 			floors_title = "Floor List", floors_sub = "What's tracked on each floor. Tap to select.", active = "ACTIVE",
 			tp_sub = "Floor %d destinations  •  nearest first",
-			sec_shop = "SHOP", sec_brz = "BRAZIER", sec_pump = "PUMPKIN", sec_off = "OFFERING", sec_ff = "DOORS",
+			sec_shop = "SHOP", sec_brz = "BRAZIER", sec_pump = "PUMPKIN", sec_off = "OFFERING", sec_ff = "DOORS", sec_lever = "LEVERS",
 			empty = "No targets on this floor yet. Move closer to the area, then tap Refresh.",
 			scanning_list = "Scanning for targets…", dist_away = "%d studs away",
 			auto_idle = "Grab a torch at the Brazier, then light every Pumpkin", auto_stopped = "Stopped",
@@ -542,6 +548,19 @@ local function runHollow()
 			return false
 		end
 
+		-- 3b2) PuzzleLever (floor 9): Model/Part bernama PuzzleLever
+		if obj.Name:lower() == LEVER_NAME:lower()
+			and (obj:IsA("Model") or obj:IsA("BasePart"))
+			and not candidates[obj]
+			and not insideOffering(obj)
+			and not insideCandidate(obj) then
+			candidates[obj] = {
+				target = obj, adornee = firstPart(obj),
+				color = LEVER_COLOR, name = LEVER_LABEL, nameEN = "LEVER", isFF = false, kind = "lever",
+			}
+			return false
+		end
+
 		-- 3c) Toko: Cylinder.009 di dalam folder Poles
 		if obj.Name == SHOP_PART
 			and (obj:IsA("BasePart") or obj:IsA("Model"))
@@ -585,7 +604,7 @@ local function runHollow()
 		L.builtOnce = true
 		relabel(quiet)
 		if DEBUG and not quiet then
-			local n = {mon = 0, ff = 0, off = 0, pump = 0, brz = 0, shop = 0}
+			local n = {mon = 0, ff = 0, off = 0, pump = 0, brz = 0, shop = 0, lever = 0}
 			local pumpNongol = 0
 			for _, c in pairs(candidates) do
 				n[c.kind] += 1
@@ -594,12 +613,15 @@ local function runHollow()
 				end
 			end
 			print("[ESP] Ditemukan -> monster:", n.mon, "| pintu:", n.ff, "| offering:", n.off,
-				"| pumpkin total:", n.pump, "(nongol:", pumpNongol .. ")")
+				"| pumpkin total:", n.pump, "(nongol:", pumpNongol .. ")", "| tuas:", n.lever)
 			if n.mon == 0 then
 				print("[ESP] Monster 0. Pastikan folder '" .. MOBS_FOLDER .. "' ada di Workspace (bukan ServerStorage/ReplicatedStorage).")
 			end
 			if n.pump == 0 then
 				print("[ESP] Pumpkin 0. Kalau di floor 7, pastikan namanya '" .. PUMPKIN_NAME .. "' dan sudah dimuat (dekati areanya).")
+			end
+			if n.lever == 0 then
+				print("[ESP] Tuas 0. Kalau di floor 9, pastikan namanya '" .. LEVER_NAME .. "' dan sudah dimuat (dekati areanya).")
 			end
 			print("[ESP] Objek yang namanya mengandung 'force':")
 			for _, s in ipairs(mirip) do print("   ", s) end
@@ -1035,7 +1057,8 @@ local function runHollow()
 	label(floorCard, {Position = UDim2.fromOffset(14, 12), Size = UDim2.new(1, -28, 0, 18), Font = Enum.Font.GothamBold, TextSize = 15, Text = "Floor"})
 	label(floorCard, {Position = UDim2.fromOffset(14, 32), Size = UDim2.new(1, -28, 0, 14), TextSize = 10, TextColor3 = THEME.muted, key = "floor_sub"})
 
-	local CHIP_W, CHIP_H, CHIP_GAP = 50, 32, 8
+	local FLOOR_COUNT = 9
+	local CHIP_W, CHIP_H, CHIP_GAP, CHIP_COLS = 38, 32, 8, 5
 	local chipIndicator = make("Frame", {
 		Size = UDim2.fromOffset(CHIP_W, CHIP_H), BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
 	}, floorCard)
@@ -1044,10 +1067,10 @@ local function runHollow()
 
 	local floorButtons = {}
 	local function chipPos(n)
-		local col, row = (n - 1) % 4, math.floor((n - 1) / 4)
+		local col, row = (n - 1) % CHIP_COLS, math.floor((n - 1) / CHIP_COLS)
 		return UDim2.fromOffset(14 + col * (CHIP_W + CHIP_GAP), 56 + row * (CHIP_H + CHIP_GAP))
 	end
-	for n = 1, 8 do
+	for n = 1, FLOOR_COUNT do
 		local b = make("TextButton", {
 			Position = chipPos(n), Size = UDim2.fromOffset(CHIP_W, CHIP_H),
 			BackgroundColor3 = THEME.tile, BackgroundTransparency = 0.1, BorderSizePixel = 0, AutoButtonColor = false,
@@ -1063,7 +1086,7 @@ local function runHollow()
 	end
 
 	-- ===== FLOORS TAB =====
-	local TAGS = {STATS[1], STATS[2], STATS[3], STATS[4], {"brz", "Brazier", BRAZIER_COLOR}, {"shop", "Toko", SHOP_COLOR}}
+	local TAGS = {STATS[1], STATS[2], STATS[3], STATS[4], {"brz", "Brazier", BRAZIER_COLOR}, {"shop", "Toko", SHOP_COLOR}, {"lever", "Tuas", LEVER_COLOR}}
 	label(floorsPage, {Position = UDim2.fromOffset(2, 0), Size = UDim2.new(1, 0, 0, 20), Font = Enum.Font.GothamBold, TextSize = 15, key = "floors_title"})
 	label(floorsPage, {Position = UDim2.fromOffset(2, 20), Size = UDim2.new(1, 0, 0, 14), TextSize = 10, TextColor3 = THEME.muted, key = "floors_sub"})
 
@@ -1076,7 +1099,7 @@ local function runHollow()
 	make("UIListLayout", {Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder}, floorScroll)
 
 	local floorRows = {}
-	for n = 1, 8 do
+	for n = 1, FLOOR_COUNT do
 		local row = make("TextButton", {
 			LayoutOrder = n, Size = UDim2.new(1, -10, 0, 54),
 			BackgroundColor3 = THEME.card, AutoButtonColor = false, Text = "", BorderSizePixel = 0,
@@ -1365,6 +1388,7 @@ local function runHollow()
 
 	local function setStat(kind, value)
 		local s = statBoxes[kind]
+		if not s then return end
 		local txt = tostring(value)
 		if s.num.Text ~= txt then
 			s.num.Text = txt
@@ -1634,7 +1658,8 @@ local function runHollow()
 	end
 
 	local function interact(c, deep)
-		if c.kind == "ff" or c.kind == "shop" then return 0 end
+		-- tuas (lever) sengaja TIDAK ditarik otomatis; teleport saja
+		if c.kind == "ff" or c.kind == "shop" or c.kind == "lever" then return 0 end
 		local match = (c.kind == "brz" and matchTorch) or (c.kind == "pump" and matchLight) or nil
 		local n = 0
 		for _, p in ipairs(findPrompts(c.target, match, deep)) do
@@ -1675,7 +1700,7 @@ local function runHollow()
 			return
 		end
 		showToast('<font color="' .. hex(c.color) .. '">●</font>  ' .. esc(L.T("toast_tp", displayName)), c.color)
-		if AUTO_PROMPT and c.kind ~= "ff" and c.kind ~= "shop" then
+		if AUTO_PROMPT and c.kind ~= "ff" and c.kind ~= "shop" and c.kind ~= "lever" then
 			task.wait(0.35)
 			if c.kind == "pump" then equipTorch() end
 			local n = interact(c, true)
@@ -1861,7 +1886,7 @@ local function runHollow()
 		if cfg.brz and cfg.pump then addAutoCard() end
 
 		local total = 0
-		for _, sec in ipairs({{"shop", "TOKO"}, {"brz", "BRAZIER"}, {"pump", "PUMPKIN"}, {"off", "OFFERING"}, {"ff", "PINTU"}}) do
+		for _, sec in ipairs({{"shop", "TOKO"}, {"brz", "BRAZIER"}, {"pump", "PUMPKIN"}, {"lever", "TUAS"}, {"off", "OFFERING"}, {"ff", "PINTU"}}) do
 			if cfg[sec[1]] then
 				local list = collectTargets(sec[1])
 				if #list > 0 then
@@ -1902,7 +1927,7 @@ local function runHollow()
 
 		local cfg = FLOORS[currentFloor]
 		local found = {}
-		local count = {ff = 0, off = 0, mon = 0, pump = 0, brz = 0, shop = 0}
+		local count = {ff = 0, off = 0, mon = 0, pump = 0, brz = 0, shop = 0, lever = 0}
 
 		for key, c in pairs(candidates) do
 			if not c.target:IsDescendantOf(workspace) then
